@@ -10,6 +10,7 @@ it finds at random, and shows the image with their names listed below.
 Play: left-click an object in the picture. Its name is struck off the list and
 the object is covered by a dark overlay. Found objects stay struck off and
 darkened until you have found them all.
+Press N for a new game (a fresh random set from the same image; no re-run of SAM 3).
 
 Setup:
     pip install -U transformers torch pillow numpy matplotlib accelerate
@@ -274,76 +275,100 @@ def unique_labels(chosen):
     return labels
 
 
-def show(image, chosen, overlay):
+def pick_chosen(instances):
+    """Pick 5-20 objects at random (fewer if the image doesn't have that many)."""
+    n = min(random.randint(5, 20), len(instances))
+    return random.sample(instances, n) if n else []
+
+
+def show(image, instances, overlay):
     """Hidden-object game: find the listed objects in the picture.
 
     Left-click an object: its name is struck off the list and the object is
     covered with a dark overlay. Found objects stay struck off and darkened.
+    Press N for a new game: a fresh random set of objects from the same image
+    (SAM 3 is not run again).
     """
-    base = np.asarray(image).astype(np.float32)
-    h, w = base.shape[:2]
-
-    if overlay and chosen:  # cheat/debug mode: tint every hidden object
-        cmap = plt.get_cmap("tab20")
-        for i, inst in enumerate(chosen):
-            if inst.mask.shape == (h, w):
-                color = np.array(cmap(i % 20)[:3]) * 255
-                base[inst.mask] = base[inst.mask] * 0.6 + color * 0.4
+    original = np.asarray(image).astype(np.float32)
+    h, w = original.shape[:2]
 
     fig = plt.figure(figsize=(9, 10))
     gs = fig.add_gridspec(2, 1, height_ratios=[4, 1.3])
 
     ax_img = fig.add_subplot(gs[0])
-    ax_img.imshow(base.astype(np.uint8))
     ax_img.axis("off")
+    img_artist = ax_img.imshow(original.astype(np.uint8))
     # Transparent layer on top of the picture; found objects get painted dark into it.
     dark = np.zeros((h, w, 4), dtype=np.uint8)
     dark_layer = ax_img.imshow(dark, interpolation="nearest")
 
     ax_txt = fig.add_subplot(gs[1])
     ax_txt.axis("off")
+    title = ax_txt.text(0.5, 1.0, "", ha="center", va="top", fontsize=12, transform=ax_txt.transAxes)
 
-    if not chosen:
-        ax_txt.text(0.5, 0.9, "No objects found. Try lowering --threshold or supplying more --concepts.",
-                    ha="center", va="top", fontsize=12, transform=ax_txt.transAxes)
+    if not instances:
+        title.set_text("No objects found. Try lowering --threshold or supplying more --concepts.")
         fig.tight_layout()
         plt.show()
         return
 
-    labels = unique_labels(chosen)
-    total = len(chosen)
-    title = ax_txt.text(0.5, 1.0, "", ha="center", va="top", fontsize=12, transform=ax_txt.transAxes)
+    ax_txt.text(0.5, 0.0, "Press N for a new game", ha="center", va="bottom",
+                fontsize=9, color="#888888", transform=ax_txt.transAxes)
 
-    rows = min(ROWS_PER_COLUMN, total)
-    ncols = math.ceil(total / rows)
-    col_w = 0.3
-    left = 0.5 - ncols * col_w / 2
     default_color = plt.rcParams["text.color"]
-    texts = []
-    for i, label in enumerate(labels):
-        col, row = divmod(i, rows)
-        texts.append(ax_txt.text(
-            left + col * col_w, 0.82 - row * 0.115, f"\u2022 {label}",
-            ha="left", va="top", fontsize=11, color=default_color,
-            transform=ax_txt.transAxes,
-        ))
+    game = {"chosen": [], "labels": [], "texts": [], "areas": [], "found": set()}
 
-    areas = [inst.mask.sum() for inst in chosen]
-    found = set()
+    def render_base(chosen):
+        base = original.copy()
+        if overlay:  # cheat/debug mode: tint every hidden object
+            cmap = plt.get_cmap("tab20")
+            for i, inst in enumerate(chosen):
+                if inst.mask.shape == (h, w):
+                    color = np.array(cmap(i % 20)[:3]) * 255
+                    base[inst.mask] = base[inst.mask] * 0.6 + color * 0.4
+        return base.astype(np.uint8)
 
     def update_title():
-        if len(found) == total:
-            title.set_text(f"All {total} objects found!")
+        total, n_found = len(game["chosen"]), len(game["found"])
+        if n_found == total:
+            title.set_text(f"All {total} objects found!  Press N for a new game")
             title.set_fontweight("bold")
         else:
-            title.set_text(f"Found {len(found)} of {total}: click the objects in the picture")
+            title.set_text(f"Found {n_found} of {total}: click the objects in the picture")
+            title.set_fontweight("normal")
+
+    def new_game():
+        chosen = pick_chosen(instances)
+        for t in game["texts"]:
+            t.remove()
+        labels = unique_labels(chosen)
+        rows = min(ROWS_PER_COLUMN, len(labels))
+        ncols = math.ceil(len(labels) / rows)
+        col_w = 0.3
+        left = 0.5 - ncols * col_w / 2
+        texts = []
+        for i, label in enumerate(labels):
+            col, row = divmod(i, rows)
+            texts.append(ax_txt.text(
+                left + col * col_w, 0.82 - row * 0.115, f"\u2022 {label}",
+                ha="left", va="top", fontsize=11, color=default_color,
+                transform=ax_txt.transAxes,
+            ))
+        game.update(chosen=chosen, labels=labels, texts=texts,
+                    areas=[inst.mask.sum() for inst in chosen], found=set())
+        dark[:] = 0
+        dark_layer.set_data(dark)
+        img_artist.set_data(render_base(chosen))
+        update_title()
+        print("Chosen:", [i.name for i in chosen])
+        fig.canvas.draw_idle()
 
     def mark_found(idx):
-        found.add(idx)
-        dark[chosen[idx].mask] = DARKEN_RGBA
+        game["found"].add(idx)
+        dark[game["chosen"][idx].mask] = DARKEN_RGBA
         dark_layer.set_data(dark)
-        texts[idx].set_text(f"\u2022 {strike(labels[idx])}")
-        texts[idx].set_color(FOUND_TEXT_COLOR)
+        game["texts"][idx].set_text(f"\u2022 {strike(game['labels'][idx])}")
+        game["texts"][idx].set_color(FOUND_TEXT_COLOR)
         update_title()
         fig.canvas.draw_idle()
 
@@ -359,14 +384,19 @@ def show(image, chosen, overlay):
         # If several objects overlap at this pixel, the smallest (most specific) one is
         # the target. Clicking empty space or an already-found object does nothing, so
         # a stray second click on a found item never reveals the larger object behind it.
-        hits = [i for i, inst in enumerate(chosen) if inst.mask[y, x]]
+        hits = [i for i, inst in enumerate(game["chosen"]) if inst.mask[y, x]]
         if hits:
-            target = min(hits, key=lambda i: areas[i])
-            if target not in found:
+            target = min(hits, key=lambda i: game["areas"][i])
+            if target not in game["found"]:
                 mark_found(target)
 
-    update_title()
+    def on_key(event):
+        if event.key in ("n", "N"):
+            new_game()
+
     fig.canvas.mpl_connect("button_press_event", on_click)
+    fig.canvas.mpl_connect("key_press_event", on_key)
+    new_game()
     fig.tight_layout()
     plt.show()
 
@@ -403,10 +433,7 @@ def main():
     instances = dedupe(instances)
     print(f"{len(instances)} distinct objects found")
 
-    n = min(random.randint(5, 20), len(instances))
-    chosen = random.sample(instances, n) if n else []
-    print("Chosen:", [i.name for i in chosen])
-    show(image, chosen, args.overlay)
+    show(image, instances, args.overlay)
 
 
 if __name__ == "__main__":
