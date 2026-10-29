@@ -110,6 +110,57 @@ eye mask, hair straightener, deodorant, boarding pass, ticket, keys,
 tablet, e-reader, power bank, zipper
 """
 
+DESK = """
+stapler, tape dispenser, paper clip, binder clip, sticky notes, notepad, notebook,
+pencil, pencil case, pencil sharpener, eraser, ruler, highlighter, marker,
+calculator, desk lamp, mouse pad, webcam, laptop stand, monitor stand, USB flash drive,
+external hard drive, docking station, power strip, cable, desk organizer,
+pen holder, calendar, planner, folder, binder, envelope, paper tray, letter opener,
+hole punch, glue stick, correction tape, rubber band, push pin, clipboard,
+paperweight, business card, whiteboard, desk fan, headset, stylus
+"""
+ 
+TOYS = """
+toy car, toy truck, toy train, toy robot, toy airplane, toy boat, toy dinosaur,
+toy horse, rocking horse, action figure, doll, dollhouse, stuffed animal,
+puppet, building blocks, wooden blocks, jigsaw puzzle, rubber duck, rattle,
+pacifier, xylophone, toy piano, toy drum, yo-yo, spinning top, marbles,
+jump rope, bouncy ball, beach ball, play dough, crayons, coloring book,
+chalk, bubble wand, slinky, tricycle, toy kitchen, toy phone, water gun,
+toy figurine, ride-on toy, sandbox toy
+"""
+ 
+GAMES = """
+playing cards, deck of cards, dice, chess board, chess piece, checkers board,
+checker piece, board game, game box, game board, dominoes, poker chips,
+letter tile, puzzle box, puzzle cube, video game controller, game console,
+joystick, game cartridge, handheld game console, VR headset, arcade machine,
+pinball machine, dartboard, dart, billiard ball, pool cue, ping pong paddle,
+table tennis ball, foosball table, mahjong tile, tarot cards, game timer,
+hourglass, trophy, medal, game spinner, game pawn, score pad, bingo card
+"""
+ 
+BATHROOM = """
+toilet paper, toilet paper roll, toothbrush, electric toothbrush, toothpaste,
+toothbrush holder, mouthwash, dental floss, soap dispenser, bar of soap,
+shampoo bottle, conditioner bottle, body wash, razor, shaving cream,
+hand towel, bath towel, washcloth, bath mat, shower curtain, showerhead,
+bathtub, faucet, bathroom scale, comb, cotton swabs, cotton balls, tissue box,
+trash can, plunger, toilet brush, loofah, sponge, nail clippers, tweezers,
+medicine cabinet, first aid kit, pill bottle, adhesive bandage, towel rack,
+laundry hamper, nail polish, makeup bag, curling iron, hand sanitizer,
+bubble bath, air freshener
+"""
+ 
+BEDROOM = """
+mattress, pillowcase, duvet, comforter, bed sheet, quilt, bedspread, headboard,
+bed frame, bunk bed, crib, nightstand, bedside lamp, dresser, wardrobe,
+closet door, curtains, window blinds, ceiling fan, floor lamp, throw pillow,
+bean bag, nightlight, humidifier, wall art, poster, picture frame, bookshelf,
+reading glasses, eye mask, phone charger, alarm clock, laundry basket,
+slippers, pajamas, stuffed animal, armchair, jewelry box, rug
+"""
+ 
 CONCEPT_GROUPS = {
     "general": DEFAULT_CONCEPTS,
     "closet": CLOSET,
@@ -118,6 +169,11 @@ CONCEPT_GROUPS = {
     "dishwasher": DISHWASHER,
     "pantry": PANTRY,
     "suitcase": SUITCASE,
+    "desk": DESK,
+    "toys": TOYS,
+    "games": GAMES,
+    "bathroom": BATHROOM,
+    "bedroom": BEDROOM,
 }
 
 
