@@ -24,23 +24,34 @@ Run:
     python segment_and_name_sam3.py photo.jpg --concepts my_concepts.txt
     python segment_and_name_sam3.py photo.jpg                      # auto-picks concept groups from the scene
     python segment_and_name_sam3.py photo.jpg --groups bathroom,toys   # choose groups yourself
+    python segment_and_name_sam3.py photo.jpg --fast                # 560px: much faster on CPU
+    python segment_and_name_sam3.py photo.jpg --pool 40            # stop after 40 distinct objects (0 = search all concepts)
+    # Results are cached per photo, so the second run starts instantly (--recompute to redo).
     python segment_and_name_sam3.py photo.jpg --groups refrigerator --half   # fastest settings
     python segment_and_name_sam3.py photo.jpg --cheat  # tint all hidden objects (debugging)
 """
 import argparse
+import hashlib
+import json
 import random
 import time
 import math
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
-from transformers import CLIPModel, CLIPProcessor, Sam3Model, Sam3Processor
+from transformers import CLIPModel, CLIPProcessor, Sam3Config, Sam3Model, Sam3Processor
 
 SAM3_MODEL = "facebook/sam3"
+DEFAULT_POOL = 30       # stop searching once this many distinct objects are found (0 = search everything)
+MIN_POOL = 20           # a game uses up to 20 objects, so never stop below this
+DEFAULT_MAX_PER_CONCEPT = 3   # keep at most this many instances per concept (best scores)
+FAST_SIZE = 560        # resolution used by --fast (SAM 3 normally runs at 1008)
+CACHE_VERSION = 1      # bump to invalidate old caches
 MAX_SIDE = 1280        # downscale very large images for speed/memory
 MIN_AREA = 0.001       # ignore instances smaller than this fraction of the image
 DEDUPE_IOU = 0.7       # drop overlapping instances found under different concepts
@@ -290,19 +301,24 @@ def detect_groups(image, device, top_k, clip_name):
     return picked
 
 
-def load_model(device, half):
-    """Load SAM 3, optionally in half precision (CUDA only) for roughly 2x speed."""
+def load_model(device, half, fast):
+    """Load SAM 3. half = half precision (CUDA only); fast = lower input resolution."""
+    kwargs = {}
+    if fast:
+        config = Sam3Config.from_pretrained(SAM3_MODEL)
+        config.image_size = FAST_SIZE
+        kwargs["config"] = config
     if half and device == "cuda":
         dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         print(f"Using {dtype} precision")
         try:
-            model = Sam3Model.from_pretrained(SAM3_MODEL, dtype=dtype)
+            model = Sam3Model.from_pretrained(SAM3_MODEL, dtype=dtype, **kwargs)
         except TypeError:   # older transformers call this argument torch_dtype
-            model = Sam3Model.from_pretrained(SAM3_MODEL, torch_dtype=dtype)
+            model = Sam3Model.from_pretrained(SAM3_MODEL, torch_dtype=dtype, **kwargs)
     else:
         if half:
             print("--half only applies on CUDA GPUs; using full precision")
-        model = Sam3Model.from_pretrained(SAM3_MODEL)
+        model = Sam3Model.from_pretrained(SAM3_MODEL, **kwargs)
     return model.to(device).eval()
 
 
@@ -312,8 +328,13 @@ def sync(device):
 
 
 @torch.no_grad()
-def find_instances(image, concepts, device, threshold, half):
-    """Run SAM 3 once per concept and collect every named instance.
+def find_instances(image, concepts, device, threshold, half, fast=False,
+                   pool=DEFAULT_POOL, max_per_concept=DEFAULT_MAX_PER_CONCEPT, seed=None):
+    """Run SAM 3 over the concepts (in random order) and collect named instances.
+
+    Concepts are shuffled and searching stops once `pool` distinct objects have been
+    found, so a photo with plenty of objects needs only part of the list while the
+    pool is still a random sample. pool=0 searches the whole list.
 
     The expensive vision backbone runs ONCE for the image; each concept then only
     needs the (much lighter) text + detection + mask heads, reusing those embeddings.
@@ -321,8 +342,16 @@ def find_instances(image, concepts, device, threshold, half):
     print(f"Loading {SAM3_MODEL} on {device}...")
     if device == "cpu":
         print("  Warning: running on CPU. SAM 3 is very slow here; a CUDA GPU is strongly recommended.")
-    model = load_model(device, half)
-    processor = Sam3Processor.from_pretrained(SAM3_MODEL)
+        print(f"  PyTorch {torch.__version__}; built with CUDA: {torch.version.cuda or 'NO (CPU-only build)'}; "
+              f"torch.cuda.is_available() = {torch.cuda.is_available()}")
+        print("  With an NVIDIA GPU, reinstall PyTorch with CUDA support: https://pytorch.org/get-started/locally/")
+        print("  Tips for CPU: use --fast, fewer concepts (--auto-top 1 or a short --concepts file). "
+              "Results are cached, so each photo only needs one slow run.")
+    if fast:
+        print(f"Fast mode: running SAM 3 at {FAST_SIZE}px (quicker, somewhat less accurate)")
+    model = load_model(device, half, fast)
+    proc_kwargs = {"size": {"height": FAST_SIZE, "width": FAST_SIZE}} if fast else {}
+    processor = Sam3Processor.from_pretrained(SAM3_MODEL, **proc_kwargs)
 
     t0 = time.time()
     img_inputs = processor(images=image, return_tensors="pt").to(device)
@@ -331,24 +360,37 @@ def find_instances(image, concepts, device, threshold, half):
     print(f"Image encoded once in {time.time() - t0:.1f}s")
     sizes = img_inputs.get("original_sizes").tolist()
 
+    order = list(concepts)
+    random.Random(seed).shuffle(order)   # random order => an early stop still gives a random sample
     found = []
     t1 = time.time()
-    for i, name in enumerate(concepts, 1):
+    searched = 0
+    for name in order:
+        searched += 1
         text_inputs = processor(text=name, return_tensors="pt").to(device)
         outputs = model(vision_embeds=vision_embeds, **text_inputs)
         res = processor.post_process_instance_segmentation(
             outputs, threshold=threshold, mask_threshold=0.5, target_sizes=sizes,
         )[0]
-        for mask, score in zip(res["masks"], res["scores"]):
+        # Best-scoring instances first; cap per concept so one concept can't fill the pool.
+        hits = sorted(zip(res["masks"], (float(s) for s in res["scores"])),
+                      key=lambda t: t[1], reverse=True)[:max_per_concept]
+        for mask, score in hits:
             m = mask.detach().cpu().numpy().astype(bool)
             if m.mean() >= MIN_AREA:
-                found.append(Instance(name, m, float(score)))
-        if i % 10 == 0 or i == len(concepts):
-            per = (time.time() - t1) / i
-            eta = per * (len(concepts) - i)
-            print(f"  {i}/{len(concepts)} concepts, {len(found)} instances, "
-                  f"{per:.2f}s/concept, ~{eta:.0f}s left", end="\r")
-    print()
+                found.append(Instance(name, m, score))
+
+        if searched % 5 == 0 or searched == len(order):
+            found = dedupe(found)   # count distinct objects, not overlapping duplicates
+            per = (time.time() - t1) / searched
+            target = f" (stopping at {pool})" if pool else ""
+            print(f"  searched {searched}/{len(order)} concepts, {len(found)} distinct objects{target}, "
+                  f"{per:.2f}s/concept", end="\r")
+            if pool and len(found) >= pool:
+                print(f"\n  Enough objects found after {searched} of {len(order)} concepts; stopping early.")
+                break
+    else:
+        print()
     return found
 
 
@@ -521,6 +563,55 @@ def show(image, instances, overlay):
     plt.show()
 
 
+def cache_path_for(cache_dir, image_path, args):
+    """Cache file name derived from the image *content* and every setting that changes the result."""
+    with open(image_path, "rb") as f:
+        image_hash = hashlib.sha1(f.read()).hexdigest()
+    concepts_hash = None
+    if args.concepts:
+        with open(args.concepts, encoding="utf-8") as f:
+            concepts_hash = hashlib.sha1(f.read().encode("utf-8")).hexdigest()
+    settings = {
+        "version": CACHE_VERSION, "image": image_hash, "model": SAM3_MODEL,
+        "fast": bool(args.fast), "threshold": args.threshold, "max_side": MAX_SIDE,
+        "min_area": MIN_AREA, "dedupe_iou": DEDUPE_IOU,
+        "concepts_file": concepts_hash,
+        "pool": args.pool, "seed": args.seed, "max_per_concept": args.max_per_concept,
+        "groups": None if args.concepts else args.groups,
+        "auto_top": args.auto_top if (args.groups == "auto" and not args.concepts) else None,
+    }
+    key = hashlib.sha1(json.dumps(settings, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    return Path(cache_dir) / f"{key}.sam3cache.npz"   # content-based: works for copies/renames of the photo
+
+
+def save_cache(path, instances, shape):
+    h, w = shape
+    packed = [np.packbits(i.mask.reshape(-1)) for i in instances]
+    masks = np.stack(packed) if packed else np.zeros((0, (h * w + 7) // 8), dtype=np.uint8)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path, names=np.array([i.name for i in instances], dtype=str),
+        scores=np.array([i.score for i in instances], dtype=np.float32),
+        masks=masks, shape=np.array([h, w]),
+    )
+
+
+def load_cache(path, shape):
+    """Return the cached instances, or None if the file is unreadable or doesn't fit this image."""
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            if tuple(int(x) for x in data["shape"]) != tuple(shape):
+                return None
+            h, w = shape
+            return [
+                Instance(str(name), np.unpackbits(row)[:h * w].reshape(h, w).astype(bool), float(score))
+                for name, score, row in zip(data["names"], data["scores"], data["masks"])
+            ]
+    except Exception as e:   # corrupt or incompatible cache: just recompute
+        print(f"  (ignoring unreadable cache: {e})")
+        return None
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("image", nargs="?", help="PNG/JPEG path (omit for a file dialog)")
@@ -537,6 +628,18 @@ def main():
     p.add_argument("--threshold", type=float, default=0.5, help="SAM 3 detection threshold")
     p.add_argument("--half", action="store_true",
                    help="run in half precision on a CUDA GPU (faster, less memory)")
+    p.add_argument("--pool", type=int, default=DEFAULT_POOL,
+                   help=f"search concepts in random order and stop once this many distinct objects are found "
+                        f"(default {DEFAULT_POOL}; minimum {MIN_POOL}; 0 = search every concept)")
+    p.add_argument("--seed", type=int, help="seed for the random concept order (reproducible searches)")
+    p.add_argument("--max-per-concept", type=int, default=DEFAULT_MAX_PER_CONCEPT,
+                   help="keep at most this many instances of any one concept")
+    p.add_argument("--fast", action="store_true",
+                   help=f"run SAM 3 at {FAST_SIZE}px instead of 1008: much faster on CPU, somewhat less accurate")
+    p.add_argument("--no-cache", action="store_true", help="don't read or write the result cache")
+    p.add_argument("--recompute", action="store_true", help="ignore any cached result and overwrite it")
+    p.add_argument("--cache-dir", default=str(Path.home() / ".cache" / "sam3_hidden_objects"),
+                   help="where results are cached (copy a cache file to another machine to reuse it)")
     p.add_argument("--batch", type=int, help=argparse.SUPPRESS)  # no longer used; kept so old commands still run
     p.add_argument("--overlay", "--cheat", dest="overlay", action="store_true",
                    help="cheat mode: tint all hidden objects so you can see where they are")
@@ -549,18 +652,34 @@ def main():
 
     image = Image.open(path).convert("RGB")
     image.thumbnail((MAX_SIDE, MAX_SIDE))
-    device = pick_device()
+    shape = (image.height, image.width)
+    if 0 < args.pool < MIN_POOL:
+        print(f"--pool raised to {MIN_POOL}, since a game uses up to 20 objects")
+        args.pool = MIN_POOL
 
-    groups = args.groups
-    if groups == "auto" and not args.concepts:
-        picked = detect_groups(image, device, args.auto_top, args.scene_model)
-        groups = ",".join(["general"] + picked)
-        print(f"Auto-selected groups: {groups}")
-    concepts = load_concepts(args.concepts, groups)
-    print(f"Searching for {len(concepts)} concepts")
-    instances = find_instances(image, concepts, device, args.threshold, args.half)
-    instances = dedupe(instances)
-    print(f"{len(instances)} distinct objects found")
+    cache_file = None if args.no_cache else cache_path_for(args.cache_dir, path, args)
+    instances = None
+    if cache_file and cache_file.exists() and not args.recompute:
+        instances = load_cache(cache_file, shape)
+        if instances is not None:
+            print(f"Loaded {len(instances)} objects from cache, skipping SAM 3 ({cache_file})")
+
+    if instances is None:
+        device = pick_device()
+        groups = args.groups
+        if groups == "auto" and not args.concepts:
+            picked = detect_groups(image, device, args.auto_top, args.scene_model)
+            groups = ",".join(["general"] + picked)
+            print(f"Auto-selected groups: {groups}")
+        concepts = load_concepts(args.concepts, groups)
+        print(f"Searching for {len(concepts)} concepts")
+        instances = find_instances(image, concepts, device, args.threshold, args.half, args.fast,
+                                   args.pool, args.max_per_concept, args.seed)
+        instances = dedupe(instances)
+        print(f"{len(instances)} distinct objects found")
+        if cache_file:
+            save_cache(cache_file, instances, shape)
+            print(f"Saved results to cache: {cache_file}")
 
     show(image, instances, args.overlay)
 
