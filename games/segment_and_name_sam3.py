@@ -22,6 +22,8 @@ Run:
     python segment_and_name_sam3.py                    # file dialog
     python segment_and_name_sam3.py photo.jpg
     python segment_and_name_sam3.py photo.jpg --concepts my_concepts.txt
+    python segment_and_name_sam3.py photo.jpg                      # auto-picks concept groups from the scene
+    python segment_and_name_sam3.py photo.jpg --groups bathroom,toys   # choose groups yourself
     python segment_and_name_sam3.py photo.jpg --groups refrigerator --half   # fastest settings
     python segment_and_name_sam3.py photo.jpg --cheat  # tint all hidden objects (debugging)
 """
@@ -36,7 +38,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
-from transformers import Sam3Model, Sam3Processor
+from transformers import CLIPModel, CLIPProcessor, Sam3Model, Sam3Processor
 
 SAM3_MODEL = "facebook/sam3"
 MAX_SIDE = 1280        # downscale very large images for speed/memory
@@ -119,7 +121,7 @@ pen holder, calendar, planner, folder, binder, envelope, paper tray, letter open
 hole punch, glue stick, correction tape, rubber band, push pin, clipboard,
 paperweight, business card, whiteboard, desk fan, headset, stylus
 """
- 
+
 TOYS = """
 toy car, toy truck, toy train, toy robot, toy airplane, toy boat, toy dinosaur,
 toy horse, rocking horse, action figure, doll, dollhouse, stuffed animal,
@@ -129,7 +131,7 @@ jump rope, bouncy ball, beach ball, play dough, crayons, coloring book,
 chalk, bubble wand, slinky, tricycle, toy kitchen, toy phone, water gun,
 toy figurine, ride-on toy, sandbox toy
 """
- 
+
 GAMES = """
 playing cards, deck of cards, dice, chess board, chess piece, checkers board,
 checker piece, board game, game box, game board, dominoes, poker chips,
@@ -139,7 +141,7 @@ pinball machine, dartboard, dart, billiard ball, pool cue, ping pong paddle,
 table tennis ball, foosball table, mahjong tile, tarot cards, game timer,
 hourglass, trophy, medal, game spinner, game pawn, score pad, bingo card
 """
- 
+
 BATHROOM = """
 toilet paper, toilet paper roll, toothbrush, electric toothbrush, toothpaste,
 toothbrush holder, mouthwash, dental floss, soap dispenser, bar of soap,
@@ -151,7 +153,7 @@ medicine cabinet, first aid kit, pill bottle, adhesive bandage, towel rack,
 laundry hamper, nail polish, makeup bag, curling iron, hand sanitizer,
 bubble bath, air freshener
 """
- 
+
 BEDROOM = """
 mattress, pillowcase, duvet, comforter, bed sheet, quilt, bedspread, headboard,
 bed frame, bunk bed, crib, nightstand, bedside lamp, dresser, wardrobe,
@@ -160,7 +162,7 @@ bean bag, nightlight, humidifier, wall art, poster, picture frame, bookshelf,
 reading glasses, eye mask, phone charger, alarm clock, laundry basket,
 slippers, pajamas, stuffed animal, armchair, jewelry box, rug
 """
- 
+
 CONCEPT_GROUPS = {
     "general": DEFAULT_CONCEPTS,
     "closet": CLOSET,
@@ -174,6 +176,32 @@ CONCEPT_GROUPS = {
     "games": GAMES,
     "bathroom": BATHROOM,
     "bedroom": BEDROOM,
+}
+
+# Used by --groups auto: CLIP compares the whole image against these descriptions
+# to decide which concept groups are worth searching. "general" is always included.
+SCENE_MODEL = "openai/clip-vit-base-patch32"   # small and fast; enough for scene type
+AUTO_TOP_GROUPS = 3
+GROUP_SCENE_PROMPTS = {
+    "closet": ["a photo of a closet", "a photo of clothes hanging in a wardrobe",
+               "a photo of shoes and clothes on closet shelves"],
+    "dresser": ["a photo of a dresser with open drawers",
+                "a photo of folded clothes and jewelry on a dresser"],
+    "refrigerator": ["a photo of the inside of a refrigerator",
+                     "a photo of food on refrigerator shelves"],
+    "dishwasher": ["a photo of the inside of a dishwasher",
+                   "a photo of clean dishes and glasses in a dish rack"],
+    "pantry": ["a photo of a kitchen pantry",
+               "a photo of a shelf with canned food and jars"],
+    "suitcase": ["a photo of an open suitcase",
+                 "a photo of packed luggage with travel items"],
+    "desk": ["a photo of an office desk",
+             "a photo of a desk with stationery and a computer"],
+    "toys": ["a photo of a pile of toys", "a photo of a children's playroom"],
+    "games": ["a photo of board games and playing cards",
+              "a photo of video games and game consoles"],
+    "bathroom": ["a photo of a bathroom", "a photo of a bathroom sink with toiletries"],
+    "bedroom": ["a photo of a bedroom", "a photo of a bed with pillows and blankets"],
 }
 
 
@@ -224,6 +252,42 @@ def load_concepts(path, groups="all"):
             seen.add(c)
             out.append(c)
     return out
+
+
+@torch.no_grad()
+def detect_groups(image, device, top_k, clip_name):
+    """Pick the most relevant concept groups for this image using CLIP scene recognition.
+
+    One CLIP pass over the whole image, compared against a few descriptions per group
+    (e.g. "a photo of a bathroom"). Much cheaper than searching every group with SAM 3.
+    """
+    print(f"Recognising the scene with {clip_name}...")
+    model = CLIPModel.from_pretrained(clip_name).to(device).eval()
+    processor = CLIPProcessor.from_pretrained(clip_name)
+
+    names = list(GROUP_SCENE_PROMPTS)
+    prompts, owner = [], []
+    for g in names:
+        for text in GROUP_SCENE_PROMPTS[g]:
+            prompts.append(text)
+            owner.append(g)
+
+    inputs = processor(text=prompts, images=image, return_tensors="pt", padding=True).to(device)
+    logits = model(**inputs).logits_per_image[0].detach().float().cpu().numpy()  # one per prompt
+
+    # Score each group as the mean logit of its prompts, then softmax across groups.
+    scores = np.array([np.mean([l for l, o in zip(logits, owner) if o == g]) for g in names])
+    probs = np.exp(scores - scores.max())
+    probs /= probs.sum()
+
+    order = np.argsort(-probs)
+    picked = [names[i] for i in order[:top_k]]
+    print("  scene scores: " + ", ".join(f"{names[i]} {probs[i]:.2f}" for i in order[:6]))
+
+    del model, processor  # free memory before SAM 3 loads
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return picked
 
 
 def load_model(device, half):
@@ -462,10 +526,14 @@ def main():
     p.add_argument("image", nargs="?", help="PNG/JPEG path (omit for a file dialog)")
     p.add_argument("--concepts", help="text file with one concept phrase per line (overrides --groups)")
     p.add_argument(
-        "--groups", default="all",
-        help="comma-separated concept groups: general,closet,dresser,refrigerator,dishwasher,pantry,suitcase "
-             "(default: all)",
+        "--groups", default="auto",
+        help="'auto' (default): CLIP recognises the scene and picks the most relevant groups; "
+             "'all'; or a comma-separated list from general,closet,dresser,refrigerator,dishwasher,"
+             "pantry,suitcase,desk,toys,games,bathroom,bedroom",
     )
+    p.add_argument("--auto-top", type=int, default=AUTO_TOP_GROUPS,
+                   help="with --groups auto: how many groups to search besides 'general' (more = slower, fewer misses)")
+    p.add_argument("--scene-model", default=SCENE_MODEL, help="CLIP model used by --groups auto")
     p.add_argument("--threshold", type=float, default=0.5, help="SAM 3 detection threshold")
     p.add_argument("--half", action="store_true",
                    help="run in half precision on a CUDA GPU (faster, less memory)")
@@ -483,7 +551,12 @@ def main():
     image.thumbnail((MAX_SIDE, MAX_SIDE))
     device = pick_device()
 
-    concepts = load_concepts(args.concepts, args.groups)
+    groups = args.groups
+    if groups == "auto" and not args.concepts:
+        picked = detect_groups(image, device, args.auto_top, args.scene_model)
+        groups = ",".join(["general"] + picked)
+        print(f"Auto-selected groups: {groups}")
+    concepts = load_concepts(args.concepts, groups)
     print(f"Searching for {len(concepts)} concepts")
     instances = find_instances(image, concepts, device, args.threshold, args.half)
     instances = dedupe(instances)
