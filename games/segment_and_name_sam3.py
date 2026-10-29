@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
 """
-Find and name objects with SAM 3, pick 5-20 at random, and show the image
-with the list of names below it. The display is interactive: left-click an
-object in the image and its name turns red in the list while its outline is
-drawn over the image.
+Hidden-object game built with SAM 3.
 
 SAM 3 segments by *concept*: you give it a short noun phrase ("dog", "coffee
-mug") and it returns a mask for every matching instance, already named. So
-there is no separate naming model; the program just runs SAM 3 over a list of
-candidate concepts and keeps whatever it finds.
+mug") and it returns a mask for every matching instance, already named. The
+program runs SAM 3 over a list of candidate concepts, picks 5-20 of the objects
+it finds at random, and shows the image with their names listed below.
+
+Play: left-click an object in the picture. Its name is struck off the list and
+the object is covered by a dark overlay. Found objects stay struck off and
+darkened until you have found them all.
 
 Setup:
     pip install -U transformers torch pillow numpy matplotlib accelerate
     # facebook/sam3 is a gated model: request access at
     # https://huggingface.co/facebook/sam3 , then log in:
-    huggingface-cli login
+    hf auth login
 
 Run:
     python segment_and_name_sam3.py                    # file dialog
     python segment_and_name_sam3.py photo.jpg
-    python segment_and_name_sam3.py photo.jpg --concepts my_concepts.txt --overlay
+    python segment_and_name_sam3.py photo.jpg --concepts my_concepts.txt
     python segment_and_name_sam3.py photo.jpg --groups refrigerator --half   # fastest settings
+    python segment_and_name_sam3.py photo.jpg --cheat  # tint all hidden objects (debugging)
 """
 import argparse
 import random
@@ -248,19 +250,14 @@ def dedupe(instances):
     return kept
 
 
-HIGHLIGHT_RGB = (255, 42, 42)
-HIGHLIGHT_HEX = "#ff2a2a"
+FOUND_TEXT_COLOR = "#8a8a8a"       # greyed-out colour for names already found
+DARKEN_RGBA = (0, 0, 0, 175)       # dark overlay laid over found objects (alpha 0-255)
 ROWS_PER_COLUMN = 7
 
 
-def make_outline(mask, thickness):
-    """Boolean image that is True on the inner border of `mask`, `thickness` px wide."""
-    eroded = mask.copy()
-    for _ in range(thickness):
-        p = np.pad(eroded, 1, constant_values=False)
-        eroded = (p[1:-1, 1:-1] & p[:-2, 1:-1] & p[2:, 1:-1]
-                  & p[1:-1, :-2] & p[1:-1, 2:])
-    return mask & ~eroded
+def strike(text):
+    """Strike-through via the Unicode combining long stroke (matplotlib has no strike style)."""
+    return "".join(ch + "\u0336" for ch in text)
 
 
 def unique_labels(chosen):
@@ -278,12 +275,15 @@ def unique_labels(chosen):
 
 
 def show(image, chosen, overlay):
-    """Interactive display: left-click an object in the image to highlight it
-    (red outline on the image, red bold name in the list)."""
+    """Hidden-object game: find the listed objects in the picture.
+
+    Left-click an object: its name is struck off the list and the object is
+    covered with a dark overlay. Found objects stay struck off and darkened.
+    """
     base = np.asarray(image).astype(np.float32)
     h, w = base.shape[:2]
 
-    if overlay and chosen:  # optional faint tint of every chosen object
+    if overlay and chosen:  # cheat/debug mode: tint every hidden object
         cmap = plt.get_cmap("tab20")
         for i, inst in enumerate(chosen):
             if inst.mask.shape == (h, w):
@@ -296,9 +296,9 @@ def show(image, chosen, overlay):
     ax_img = fig.add_subplot(gs[0])
     ax_img.imshow(base.astype(np.uint8))
     ax_img.axis("off")
-    # Transparent layer on top of the image; we paint the outline into it on click.
-    empty = np.zeros((h, w, 4), dtype=np.uint8)
-    outline_layer = ax_img.imshow(empty, interpolation="nearest")
+    # Transparent layer on top of the picture; found objects get painted dark into it.
+    dark = np.zeros((h, w, 4), dtype=np.uint8)
+    dark_layer = ax_img.imshow(dark, interpolation="nearest")
 
     ax_txt = fig.add_subplot(gs[1])
     ax_txt.axis("off")
@@ -310,12 +310,12 @@ def show(image, chosen, overlay):
         plt.show()
         return
 
-    ax_txt.text(0.5, 1.0, f"{len(chosen)} objects chosen at random: click one in the image to highlight it",
-                ha="center", va="top", fontsize=11, transform=ax_txt.transAxes)
-
     labels = unique_labels(chosen)
-    rows = min(ROWS_PER_COLUMN, len(labels))
-    ncols = math.ceil(len(labels) / rows)
+    total = len(chosen)
+    title = ax_txt.text(0.5, 1.0, "", ha="center", va="top", fontsize=12, transform=ax_txt.transAxes)
+
+    rows = min(ROWS_PER_COLUMN, total)
+    ncols = math.ceil(total / rows)
     col_w = 0.3
     left = 0.5 - ncols * col_w / 2
     default_color = plt.rcParams["text.color"]
@@ -329,28 +329,22 @@ def show(image, chosen, overlay):
         ))
 
     areas = [inst.mask.sum() for inst in chosen]
-    thickness = max(2, round(max(h, w) / 400))
-    outline_cache = {}
-    state = {"selected": None}
+    found = set()
 
-    def set_selected(idx):
-        prev = state["selected"]
-        if prev == idx:
-            return
-        if prev is not None:
-            texts[prev].set_color(default_color)
-            texts[prev].set_fontweight("normal")
-        if idx is None:
-            outline_layer.set_data(empty)
+    def update_title():
+        if len(found) == total:
+            title.set_text(f"All {total} objects found!")
+            title.set_fontweight("bold")
         else:
-            texts[idx].set_color(HIGHLIGHT_HEX)
-            texts[idx].set_fontweight("bold")
-            if idx not in outline_cache:
-                rgba = np.zeros((h, w, 4), dtype=np.uint8)
-                rgba[make_outline(chosen[idx].mask, thickness)] = (*HIGHLIGHT_RGB, 255)
-                outline_cache[idx] = rgba
-            outline_layer.set_data(outline_cache[idx])
-        state["selected"] = idx
+            title.set_text(f"Found {len(found)} of {total}: click the objects in the picture")
+
+    def mark_found(idx):
+        found.add(idx)
+        dark[chosen[idx].mask] = DARKEN_RGBA
+        dark_layer.set_data(dark)
+        texts[idx].set_text(f"\u2022 {strike(labels[idx])}")
+        texts[idx].set_color(FOUND_TEXT_COLOR)
+        update_title()
         fig.canvas.draw_idle()
 
     def on_click(event):
@@ -358,15 +352,20 @@ def show(image, chosen, overlay):
             return
         toolbar = getattr(fig.canvas, "toolbar", None)
         if toolbar is not None and getattr(toolbar, "mode", ""):
-            return  # zoom/pan tool is active; don't treat the click as a selection
+            return  # zoom/pan tool is active; don't treat the click as a guess
         x, y = int(event.xdata + 0.5), int(event.ydata + 0.5)
         if not (0 <= x < w and 0 <= y < h):
             return
+        # If several objects overlap at this pixel, the smallest (most specific) one is
+        # the target. Clicking empty space or an already-found object does nothing, so
+        # a stray second click on a found item never reveals the larger object behind it.
         hits = [i for i, inst in enumerate(chosen) if inst.mask[y, x]]
-        # If objects overlap at this pixel, pick the smallest (most specific) one.
-        # Clicking a pixel that belongs to no listed object clears the highlight.
-        set_selected(min(hits, key=lambda i: areas[i]) if hits else None)
+        if hits:
+            target = min(hits, key=lambda i: areas[i])
+            if target not in found:
+                mark_found(target)
 
+    update_title()
     fig.canvas.mpl_connect("button_press_event", on_click)
     fig.tight_layout()
     plt.show()
@@ -385,7 +384,8 @@ def main():
     p.add_argument("--half", action="store_true",
                    help="run in half precision on a CUDA GPU (faster, less memory)")
     p.add_argument("--batch", type=int, help=argparse.SUPPRESS)  # no longer used; kept so old commands still run
-    p.add_argument("--overlay", action="store_true", help="tint the chosen objects on the image")
+    p.add_argument("--overlay", "--cheat", dest="overlay", action="store_true",
+                   help="cheat mode: tint all hidden objects so you can see where they are")
     args = p.parse_args()
 
     path = args.image or choose_file()
