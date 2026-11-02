@@ -47,8 +47,8 @@ from PIL import Image
 from transformers import CLIPModel, CLIPProcessor, Sam3Config, Sam3Model, Sam3Processor
 
 SAM3_MODEL = "facebook/sam3"
-DEFAULT_POOL = 30       # stop searching once this many distinct objects are found (0 = search everything)
-MIN_POOL = 20           # a game uses up to 20 objects, so never stop below this
+DEFAULT_POOL = 20       # stop searching once this many distinct objects are found (0 = search everything)
+MIN_POOL = 10           # a game uses up to 20 objects, so never stop below this
 DEFAULT_MAX_PER_CONCEPT = 3   # keep at most this many instances per concept (best scores)
 FAST_SIZE = 560        # resolution used by --fast (SAM 3 normally runs at 1008)
 CACHE_VERSION = 1      # bump to invalidate old caches
@@ -66,7 +66,7 @@ lamp, bookshelf, cabinet, door, window, curtain, mirror, rug, clock, vase,
 potted plant, flower, tree, bush, laptop, monitor, keyboard, computer mouse,
 phone, television, remote control, speaker, headphones, camera, cup, mug,
 glass, bottle, bowl, plate, fork, knife, spoon, pot, pan, kettle, toaster,
-microwave, oven, refrigerator, sink, toilet, towel, book, paper, pen, scissors,
+microwave, oven, sink, toilet, towel, book, paper, pen, scissors,
 backpack, handbag, suitcase, umbrella, hat, helmet, shirt, jacket, dress, pants,
 shoe, glasses, watch, ball, kite, skateboard, surfboard, guitar, teddy bear,
 apple, banana, orange, tomato, carrot, broccoli, bread, cake, pizza, sandwich,
@@ -444,19 +444,37 @@ def unique_labels(chosen):
     return labels
 
 
-def pick_chosen(instances):
-    """Pick 5-20 objects at random (fewer if the image doesn't have that many)."""
-    n = min(random.randint(5, 20), len(instances))
-    return random.sample(instances, n) if n else []
+def pick_chosen(instances, namer=None):
+    """Pick 5-20 objects at random (fewer if the image doesn't have that many).
+
+    With a `namer`, the instances are unnamed segments (name None): only the picked
+    ones get named, and any the namer rejects (name "") are replaced by other random ones.
+    """
+    target = random.randint(5, 20)
+    if namer is None:
+        n = min(target, len(instances))
+        return random.sample(instances, n) if n else []
+    pool = [i for i in instances if i.name != ""]     # "" = already rejected
+    random.shuffle(pool)
+    chosen = []
+    while pool and len(chosen) < target:
+        batch = [pool.pop() for _ in range(min(target - len(chosen), len(pool)))]
+        namer(batch)
+        chosen += [i for i in batch if i.name]
+    return chosen
 
 
-def show(image, instances, overlay):
+def show(image, instances, overlay, namer=None, first_game=None):
     """Hidden-object game: find the listed objects in the picture.
 
     Left-click an object: its name is struck off the list and the object is
     covered with a dark overlay. Found objects stay struck off and darkened.
     Press N for a new game: a fresh random set of objects from the same image
     (SAM 3 is not run again).
+
+    namer / first_game are used by the free-form version (segment_then_name.py): the
+    instances are unnamed segments, `namer(list_of_instances)` names them on demand,
+    and `first_game` is the already-named set for the opening game.
     """
     original = np.asarray(image).astype(np.float32)
     h, w = original.shape[:2]
@@ -506,10 +524,27 @@ def show(image, instances, overlay):
             title.set_text(f"Found {n_found} of {total}: click the objects in the picture")
             title.set_fontweight("normal")
 
+    pending_first = [first_game] if first_game else []
+
     def new_game():
-        chosen = pick_chosen(instances)
+        if pending_first:
+            chosen = pending_first.pop()   # named earlier, while the photo was being prepared
+        else:
+            if namer is not None:
+                title.set_text("Choosing and naming objects\u2026 this can take a while")
+                title.set_fontweight("normal")
+                fig.canvas.draw()
+                fig.canvas.flush_events()
+            chosen = pick_chosen(instances, namer)
         for t in game["texts"]:
             t.remove()
+        if not chosen:
+            game.update(chosen=[], labels=[], texts=[], areas=[], found=set())
+            dark[:] = 0
+            dark_layer.set_data(dark)
+            title.set_text("No nameable objects found. Press N to try again")
+            fig.canvas.draw_idle()
+            return
         labels = unique_labels(chosen)
         rows = min(ROWS_PER_COLUMN, len(labels))
         ncols = math.ceil(len(labels) / rows)
@@ -656,7 +691,8 @@ def build_parser():
 def prepare(path, args, stop_event=None):
     """Load the photo and find its objects (from the cache when possible).
 
-    Returns (image, instances). Used by both the command line and the GUI launcher.
+    Returns (image, instances, extras); extras are extra keyword arguments for show().
+    Used by both the command line and the GUI launcher.
     """
     def check_cancel():
         if stop_event is not None and stop_event.is_set():
@@ -693,7 +729,7 @@ def prepare(path, args, stop_event=None):
         if cache_file:
             save_cache(cache_file, instances, shape)
             print(f"Saved results to cache: {cache_file}")
-    return image, instances
+    return image, instances, {}
 
 
 def main():
@@ -702,8 +738,8 @@ def main():
     if not path:
         print("No file selected.")
         return
-    image, instances = prepare(path, args)
-    show(image, instances, args.overlay)
+    image, instances, extras = prepare(path, args)
+    show(image, instances, args.overlay, **extras)
 
 
 if __name__ == "__main__":
