@@ -75,3 +75,12 @@ A simple familiar example: "Where's Waldo?", in which the objects are all under 
   --pool N: change the stopping point. It’s raised to 20 if you pick less, since a game uses up to 20 objects. --pool 0 searches every concept, as before.
   --seed N: makes the concept order reproducible, which helps when comparing runs. Without it, each run shuffles differently.
   Cache: the pool size, seed and per-concept cap are part of the cache key. If you change any of them, the photo is searched again rather than loading a stale result."
+
+### I don't want to have to activate this through command line. Make me a basic GUI
+
+- Result: created the play_hidden_objects.bat and hidden_objects_app.py
+
+### great! Now let's create a more ambitious version. current code searches for objects from a list. I want a version that segments the image, picks random segments, names them, and creates the list from that
+
+- Result: updated play_hidden_objects.bat and hidden_objects_app.py, created segment_then_name.py.
+- I then edited the _sam3.py version to include changes I made but Claude was unaware of.
