@@ -47,8 +47,8 @@ from PIL import Image
 from transformers import CLIPModel, CLIPProcessor, Sam3Config, Sam3Model, Sam3Processor
 
 SAM3_MODEL = "facebook/sam3"
-DEFAULT_POOL = 20       # stop searching once this many distinct objects are found (0 = search everything)
-MIN_POOL = 10           # a game uses up to 20 objects, so never stop below this
+DEFAULT_POOL = 30       # stop searching once this many distinct objects are found (0 = search everything)
+MIN_POOL = 20           # a game uses up to 20 objects, so never stop below this
 DEFAULT_MAX_PER_CONCEPT = 3   # keep at most this many instances per concept (best scores)
 FAST_SIZE = 560        # resolution used by --fast (SAM 3 normally runs at 1008)
 CACHE_VERSION = 1      # bump to invalidate old caches
@@ -66,7 +66,7 @@ lamp, bookshelf, cabinet, door, window, curtain, mirror, rug, clock, vase,
 potted plant, flower, tree, bush, laptop, monitor, keyboard, computer mouse,
 phone, television, remote control, speaker, headphones, camera, cup, mug,
 glass, bottle, bowl, plate, fork, knife, spoon, pot, pan, kettle, toaster,
-microwave, oven, sink, toilet, towel, book, paper, pen, scissors,
+microwave, oven, refrigerator, sink, toilet, towel, book, paper, pen, scissors,
 backpack, handbag, suitcase, umbrella, hat, helmet, shirt, jacket, dress, pants,
 shoe, glasses, watch, ball, kite, skateboard, surfboard, guitar, teddy bear,
 apple, banana, orange, tomato, carrot, broccoli, bread, cake, pizza, sandwich,
@@ -216,6 +216,10 @@ GROUP_SCENE_PROMPTS = {
 }
 
 
+class Cancelled(Exception):
+    """Raised when the user cancels a search from the GUI."""
+
+
 @dataclass
 class Instance:
     name: str
@@ -329,7 +333,8 @@ def sync(device):
 
 @torch.no_grad()
 def find_instances(image, concepts, device, threshold, half, fast=False,
-                   pool=DEFAULT_POOL, max_per_concept=DEFAULT_MAX_PER_CONCEPT, seed=None):
+                   pool=DEFAULT_POOL, max_per_concept=DEFAULT_MAX_PER_CONCEPT, seed=None,
+                   stop_event=None):
     """Run SAM 3 over the concepts (in random order) and collect named instances.
 
     Concepts are shuffled and searching stops once `pool` distinct objects have been
@@ -366,6 +371,8 @@ def find_instances(image, concepts, device, threshold, half, fast=False,
     t1 = time.time()
     searched = 0
     for name in order:
+        if stop_event is not None and stop_event.is_set():
+            raise Cancelled()
         searched += 1
         text_inputs = processor(text=name, return_tensors="pt").to(device)
         outputs = model(vision_embeds=vision_embeds, **text_inputs)
@@ -612,7 +619,7 @@ def load_cache(path, shape):
         return None
 
 
-def main():
+def build_parser():
     p = argparse.ArgumentParser()
     p.add_argument("image", nargs="?", help="PNG/JPEG path (omit for a file dialog)")
     p.add_argument("--concepts", help="text file with one concept phrase per line (overrides --groups)")
@@ -643,18 +650,23 @@ def main():
     p.add_argument("--batch", type=int, help=argparse.SUPPRESS)  # no longer used; kept so old commands still run
     p.add_argument("--overlay", "--cheat", dest="overlay", action="store_true",
                    help="cheat mode: tint all hidden objects so you can see where they are")
-    args = p.parse_args()
+    return p
 
-    path = args.image or choose_file()
-    if not path:
-        print("No file selected.")
-        return
+
+def prepare(path, args, stop_event=None):
+    """Load the photo and find its objects (from the cache when possible).
+
+    Returns (image, instances). Used by both the command line and the GUI launcher.
+    """
+    def check_cancel():
+        if stop_event is not None and stop_event.is_set():
+            raise Cancelled()
 
     image = Image.open(path).convert("RGB")
     image.thumbnail((MAX_SIDE, MAX_SIDE))
     shape = (image.height, image.width)
     if 0 < args.pool < MIN_POOL:
-        print(f"--pool raised to {MIN_POOL}, since a game uses up to 20 objects")
+        print(f"Pool size raised to {MIN_POOL}, since a game uses up to 20 objects")
         args.pool = MIN_POOL
 
     cache_file = None if args.no_cache else cache_path_for(args.cache_dir, path, args)
@@ -671,16 +683,26 @@ def main():
             picked = detect_groups(image, device, args.auto_top, args.scene_model)
             groups = ",".join(["general"] + picked)
             print(f"Auto-selected groups: {groups}")
+        check_cancel()
         concepts = load_concepts(args.concepts, groups)
         print(f"Searching for {len(concepts)} concepts")
         instances = find_instances(image, concepts, device, args.threshold, args.half, args.fast,
-                                   args.pool, args.max_per_concept, args.seed)
+                                   args.pool, args.max_per_concept, args.seed, stop_event)
         instances = dedupe(instances)
         print(f"{len(instances)} distinct objects found")
         if cache_file:
             save_cache(cache_file, instances, shape)
             print(f"Saved results to cache: {cache_file}")
+    return image, instances
 
+
+def main():
+    args = build_parser().parse_args()
+    path = args.image or choose_file()
+    if not path:
+        print("No file selected.")
+        return
+    image, instances = prepare(path, args)
     show(image, instances, args.overlay)
 
 
