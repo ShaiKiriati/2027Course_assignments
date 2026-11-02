@@ -47,8 +47,8 @@ from PIL import Image
 from transformers import CLIPModel, CLIPProcessor, Sam3Config, Sam3Model, Sam3Processor
 
 SAM3_MODEL = "facebook/sam3"
-DEFAULT_POOL = 30       # stop searching once this many distinct objects are found (0 = search everything)
-MIN_POOL = 20           # a game uses up to 20 objects, so never stop below this
+DEFAULT_POOL = 20       # stop searching once this many distinct objects are found (0 = search everything)
+MIN_POOL = 10           # a game uses up to 20 objects, so never stop below this
 DEFAULT_MAX_PER_CONCEPT = 3   # keep at most this many instances per concept (best scores)
 FAST_SIZE = 560        # resolution used by --fast (SAM 3 normally runs at 1008)
 CACHE_VERSION = 1      # bump to invalidate old caches
