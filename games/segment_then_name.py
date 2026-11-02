@@ -49,8 +49,12 @@ CLIP_MIN_CONF = 0.15    # --namer clip: reject names CLIP is unsure about
 VLM_CROP_SIZE = 384     # segments are shown to the VLM at this size
 CACHE_VERSION = 1
 REJECT_LABELS = ["background", "blurry background", "a small part of something", "a shadow", "a texture"]
-VLM_PROMPT = ("What is the main object in the middle of this image? Answer with its name only, in one to "
-              "three words. If it is only background, a texture or a fragment, answer: unclear")
+SCENE_TAG_PROMPT = ("List the main visible objects and describe the setting in a short, comma-separated list. "
+                    "Use specific names and include only things that are visibly present.")
+VLM_PROMPT = ("Scene tags: {scene_context}\n\nWhat is the main object in the middle of this image? "
+              "Use the scene tags to disambiguate it, but name only what is visible in this crop. "
+              "Answer with its name only, in one to three words. If it is only background, a texture or a "
+              "fragment, answer: unclear")
 
 BAD_NAMES = {"unclear", "unknown", "none", "nothing", "background", "image", "picture", "photo",
              "texture", "pattern", "n/a", "na", "object", "item", "thing", "something"}
@@ -158,21 +162,29 @@ class VlmNamer:
         self.model = load_vlm(model_id, device)
 
     @torch.no_grad()
-    def name_one(self, crop):
-        image = crop.resize((VLM_CROP_SIZE, VLM_CROP_SIZE))
-        messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": VLM_PROMPT}]}]
+    def generate(self, image, prompt, max_new_tokens):
+        messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]}]
         prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
         inputs = self.processor(text=prompt, images=[image], return_tensors="pt").to(self.device)
         if "pixel_values" in inputs:
             inputs["pixel_values"] = inputs["pixel_values"].to(self.model.dtype)
-        out = self.model.generate(**inputs, max_new_tokens=8, do_sample=False)
-        text = self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
-        return clean_name(text)
+        out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        return self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip()
 
-    def name_crops(self, crops):
+    def tag_scene(self, image):
+        image = image.copy()
+        image.thumbnail((512, 512))
+        return self.generate(image, SCENE_TAG_PROMPT, max_new_tokens=48)[:500]
+
+    def name_one(self, crop, scene_context):
+        image = crop.resize((VLM_CROP_SIZE, VLM_CROP_SIZE))
+        prompt = VLM_PROMPT.format(scene_context=scene_context or "unavailable")
+        return clean_name(self.generate(image, prompt, max_new_tokens=8))
+
+    def name_crops(self, crops, scene_context):
         names = []
         for k, crop in enumerate(crops, 1):
-            names.append(self.name_one(crop))
+            names.append(self.name_one(crop, scene_context))
             print(f"  {k}/{len(crops)}: {names[-1] or '(not a clear object, skipped)'}")
         return names
 
@@ -311,7 +323,8 @@ def prepare(path, args, stop_event=None):
         namer_id = sha({"namer": "clip", "model": args.clip_model, "vocab": vocab, "conf": args.min_confidence})
     else:
         backend = VlmNamer(args.vlm_model, device)
-        namer_id = sha({"namer": "vlm", "model": args.vlm_model, "prompt": VLM_PROMPT})
+        namer_id = sha({"namer": "vlm", "model": args.vlm_model, "prompt": VLM_PROMPT,
+                "scene_tag_prompt": SCENE_TAG_PROMPT})
     check_cancel()
 
     names_file = names_path(seg_path, namer_id) if seg_path else None
@@ -319,14 +332,25 @@ def prepare(path, args, stop_event=None):
         load_names(names_file, instances)
 
     image_arr = np.array(image)
+    scene_context = None
+    scene_context_loaded = False
 
     def namer(batch):
+        nonlocal scene_context, scene_context_loaded
         todo = [i for i in batch if i.name is None]
         if not todo:
             return
         print(f"Naming {len(todo)} segments...")
         crops = [crop_segment(image_arr, i.mask) for i in todo]
-        for inst, name in zip(todo, backend.name_crops(crops)):
+        if args.namer == "vlm":
+            if not scene_context_loaded:
+                scene_context = backend.tag_scene(image)
+                scene_context_loaded = True
+                print(f"  Scene tags: {scene_context or '(none)'}")
+            names = backend.name_crops(crops, scene_context)
+        else:
+            names = backend.name_crops(crops)
+        for inst, name in zip(todo, names):
             inst.name = name
         if names_file:
             save_names(names_file, instances)
