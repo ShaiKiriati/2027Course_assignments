@@ -309,7 +309,7 @@ class Session:
             ys, xs = np.nonzero(mask)
             point = int(np.random.randint(len(xs)))
             h, w = mask.shape
-            side = min(max(1, int(min(w, h) * 0.2)), w, h)
+            side = min(max(1, int(min(w, h) * 0.35)), w, h)
             left = min(max(0, int(xs[point] - side / 2)), w - side)
             top = min(max(0, int(ys[point] - side / 2)), h - side)
             return {"clue": {"x": left / w, "y": top / h,
@@ -387,7 +387,7 @@ def no_store(resp):
 
 @app.get("/")
 def index():
-    return Response(INDEX_HTML, mimetype="text/html")
+    return Response(INDEX_HTML, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/favicon.ico")
@@ -547,8 +547,10 @@ INDEX_HTML = r"""<!doctype html>
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
   button:disabled { opacity:.5; cursor:default; }
   button.link { border:none; background:none; color:var(--muted); padding:4px 8px; }
-  button.danger { background:#c62828; border-color:#c62828; color:#fff; font-weight:600; }
-  button.danger:hover { background:#a91f1f; border-color:#a91f1f; }
+  #quit { background:#c62828; border-color:#c62828; color:#fff; font-weight:600; }
+  #quit:hover { background:#a91f1f; border-color:#a91f1f; }
+  #clue { background:#ffd400; border-color:#ffd400; color:#1c2230; font-weight:600; }
+  #clue:hover { background:#e6bf00; border-color:#e6bf00; }
   .actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px; }
   .spacer { flex:1; }
   #photoPreview { max-height:90px; max-width:160px; border-radius:6px; vertical-align:middle; margin-left:10px; }
@@ -571,7 +573,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <header>
   <h1>Hidden Object Game</h1>
-  <button class="danger" id="quit" title="Stop the program">Quit</button>
+  <button id="quit" title="Stop the program">Quit</button>
 </header>
 <div id="toast" hidden></div>
 <main>
