@@ -378,7 +378,11 @@ def favicon():
 
 @app.get("/api/info")
 def api_info():
-    return jsonify(SESSION.info())
+    info = SESSION.info()
+    phone_url = app.config.get("PHONE_URL")
+    if phone_url:
+        info["phone_url"] = phone_url
+    return jsonify(info)
 
 
 @app.get("/api/status")
@@ -486,9 +490,9 @@ INDEX_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Hidden Object Game</title>
 <style>
-  :root { --bg:#f4f6f9; --card:#ffffff; --text:#1c2230; --muted:#5f6b7c; --accent:#2f6fed; --border:#d5dae3; --found:#98a1b0; --log:#0f131a; --logtext:#d8dde8; }
+  :root { --bg:#f4f6f9; --card:#ffffff; --text:#1c2230; --muted:#5f6b7c; --accent:#2f6fed; --border:#d5dae3; --found:#98a1b0; }
   @media (prefers-color-scheme: dark) {
-    :root { --bg:#12151b; --card:#1b2029; --text:#e8ebf2; --muted:#9aa3b2; --accent:#6b9bff; --border:#323a49; --found:#6c7585; --log:#0b0e13; --logtext:#d8dde8; }
+    :root { --bg:#12151b; --card:#1b2029; --text:#e8ebf2; --muted:#9aa3b2; --accent:#6b9bff; --border:#323a49; --found:#6c7585; }
   }
   [hidden] { display:none !important; }
   * { box-sizing:border-box; }
@@ -516,10 +520,14 @@ INDEX_HTML = r"""<!doctype html>
   .actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px; }
   .spacer { flex:1; }
   #photoPreview { max-height:90px; max-width:160px; border-radius:6px; vertical-align:middle; margin-left:10px; }
-  pre#log { background:var(--log); color:var(--logtext); padding:10px; border-radius:8px; height:280px; overflow:auto; white-space:pre-wrap; font:13px/1.4 Consolas, "Courier New", monospace; margin:8px 0; }
+  .progress-status { margin:8px 0; }
+  progress { display:block; width:100%; height:16px; accent-color:var(--accent); }
   #stage { position:relative; display:inline-block; max-width:100%; cursor:pointer; line-height:0; user-select:none; -webkit-user-select:none; touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
   #photo { display:block; max-width:100%; max-height:68vh; width:auto; height:auto; border-radius:6px; }
   #stage img.ov { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  #imageViewport { max-width:100%; max-height:68vh; overflow:auto; }
+  #stage { transform-origin:top left; }
+  #zoomLevel { min-width:4em; text-align:center; }
   #items { columns:3 210px; list-style:none; padding:0; margin:14px 0 0; }
   #items li { padding:2px 0; break-inside:avoid; }
   #items li.found { text-decoration:line-through; color:var(--found); }
@@ -546,7 +554,7 @@ INDEX_HTML = r"""<!doctype html>
       <div>
         <div class="card" id="modeBox">
           <h2>What kind of game?</h2>
-          <label class="row"><input type="radio" name="mode" value="list" checked> Search for objects from a word list</label>
+          <label class="row"><input type="radio" name="mode" value="list" checked> Search for objects from a word list (requires SAM3)</label>
           <label class="row"><input type="radio" name="mode" value="free"> Segment first, then name random segments</label>
         </div>
         <div class="card" id="freeBox" style="margin-top:12px">
@@ -584,8 +592,15 @@ INDEX_HTML = r"""<!doctype html>
     <div class="actions">
       <button class="primary" id="start" disabled>Start game</button>
       <button id="resume" hidden>Back to the game</button>
-      <span class="note" id="deviceNote">Loading libraries (the first time takes a little while)&hellip;</span>
+      <span class="note" id="deviceNote">Loading application libraries&hellip;</span>
     </div>
+    <div id="startupProgress" class="card" role="status" aria-live="polite">
+      <p class="progress-status" id="startupText">Loading application libraries&hellip;</p>
+      <progress id="startupBar" aria-label="Loading application libraries"></progress>
+    </div>
+    <p id="phoneAccess" class="note" hidden>
+      To play on a phone on this Wi-Fi, open <a id="phoneUrl"></a>. Only use this link on a trusted network.
+    </p>
     <p class="error" id="menuError" hidden></p>
   </section>
 
@@ -593,9 +608,10 @@ INDEX_HTML = r"""<!doctype html>
   <section id="working" hidden>
     <div class="card">
       <h2 id="workTitle">Working&hellip;</h2>
-      <pre id="log"></pre>
+      <p class="progress-status" id="jobProgressText" role="status" aria-live="polite">Preparing&hellip;</p>
+      <progress id="jobProgressBar" aria-label="Game preparation progress"></progress>
       <div class="actions"><button id="cancel">Cancel</button>
-        <span class="note">The game opens by itself when it is ready.</span></div>
+        <span class="note">The game opens automatically when it is ready.</span></div>
     </div>
   </section>
 
@@ -608,10 +624,18 @@ INDEX_HTML = r"""<!doctype html>
       <button id="toMenu">Menu</button>
     </div>
     <div id="banner" hidden></div>
-    <div id="stage">
-      <img id="photo" alt="The photo to search" draggable="false">
-      <img id="cheatLayer" class="ov" alt="" hidden>
-      <div id="overlays"></div>
+    <div class="actions" style="margin:0 0 8px" aria-label="Image zoom controls">
+      <button id="zoomOut" type="button" aria-label="Zoom out" title="Zoom out">-</button>
+      <span id="zoomLevel" class="note" aria-live="polite">100%</span>
+      <button id="zoomIn" type="button" aria-label="Zoom in" title="Zoom in">+</button>
+      <button id="zoomReset" type="button">Reset zoom</button>
+    </div>
+    <div id="imageViewport">
+      <div id="stage">
+        <img id="photo" alt="The photo to search" draggable="false">
+        <img id="cheatLayer" class="ov" alt="" hidden>
+        <div id="overlays"></div>
+      </div>
     </div>
     <ul id="items"></ul>
   </section>
@@ -621,6 +645,8 @@ INDEX_HTML = r"""<!doctype html>
 const $ = id => document.getElementById(id);
 const SETTINGS_KEY = "hidden-object-game-settings-v1";
 let info = null, gameId = null, polling = false, shownError = 0, game = null, toastTimer = null;
+let imageZoom = 1;
+const MIN_IMAGE_ZOOM = 1, MAX_IMAGE_ZOOM = 3, IMAGE_ZOOM_STEP = 0.25;
 
 async function api(url, opts) {
   const r = await fetch(url, opts);
@@ -683,13 +709,61 @@ function updateStates() {
   }
 }
 
+function updateJobProgress(s) {
+  const text = $("jobProgressText");
+  const bar = $("jobProgressBar");
+  const log = s.log || "";
+  const searched = log.match(/searched (\d+)\/(\d+) concepts/);
+  const named = [...log.matchAll(/^\s*(\d+)\/(\d+):/gm)].pop();
+  const naming = log.match(/Naming (\d+) segments\.\.\./);
+
+  if (searched) {
+    const current = Number(searched[1]), total = Number(searched[2]);
+    text.textContent = `Searching for objects: ${current} of ${total} concepts`;
+    bar.value = total ? Math.round(current / total * 100) : 0;
+    return;
+  }
+  if (named) {
+    const current = Number(named[1]), total = Number(named[2]);
+    text.textContent = `Naming objects: ${current} of ${total}`;
+    bar.value = total ? Math.round(current / total * 100) : 0;
+    return;
+  }
+
+  bar.removeAttribute("value");
+  if (naming) text.textContent = `Naming objects from ${naming[1]} image segments...`;
+  else if (/Segmenting with /.test(log)) text.textContent = "Finding objects in the photo...";
+  else if (/Recognising the scene/.test(log)) text.textContent = "Recognising the scene...";
+  else if (/Loading (?:the naming model|CLIP|facebook\/)/i.test(log)) text.textContent = "Loading an AI model...";
+  else if (/Image encoded once|Searching for \d+ concepts/.test(log)) text.textContent = "Searching the photo for objects...";
+  else if (/Choosing and naming/.test(log)) text.textContent = "Choosing objects for the game...";
+  else if (/Loaded \d+ segments from cache/.test(log)) text.textContent = "Preparing saved image segments...";
+  else if (/kept \d+ segments/.test(log)) text.textContent = "Preparing image segments...";
+  else if (s.kind === "newgame") text.textContent = "Choosing objects for the next game...";
+  else text.textContent = "Preparing the game...";
+}
+
 /* ---------- start-up ---------- */
 async function loadInfo() {
-  try { info = await api("/api/info"); } catch (e) { setTimeout(loadInfo, 1500); return; }
+  try { info = await api("/api/info"); }
+  catch (e) {
+    $("startupText").textContent = "Connecting to the game server...";
+    setTimeout(loadInfo, 1500);
+    return;
+  }
+  if (info.phone_url) {
+    $("phoneUrl").href = info.phone_url;
+    $("phoneUrl").textContent = info.phone_url;
+    $("phoneAccess").hidden = false;
+  }
   if (!info.ready) {
     $("deviceNote").textContent = info.load_error
       ? "Could not load the libraries: " + info.load_error
-      : "Loading libraries (the first time takes a little while)\u2026";
+      : "Loading application libraries...";
+    $("startupText").textContent = info.load_error
+      ? "The application libraries could not be loaded."
+      : "Loading application libraries...";
+    $("startupBar").hidden = !!info.load_error;
     if (!info.load_error) setTimeout(loadInfo, 1000);
     return;
   }
@@ -702,6 +776,7 @@ async function loadInfo() {
   }
   applySettings(loadSaved());
   updateStates();
+  $("startupProgress").hidden = true;
   $("deviceNote").textContent = info.device_label;
   $("start").disabled = false;
 }
@@ -726,13 +801,10 @@ function beginPolling() { if (!polling) { polling = true; poll(); } }
 async function poll() {
   let s;
   try { s = await api("/api/status"); } catch (e) { setTimeout(poll, 1500); return; }
-  const logEl = $("log");
-  const atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 20;
-  logEl.textContent = s.log;
-  if (atBottom) logEl.scrollTop = logEl.scrollHeight;
   if (s.error_id > shownError) { shownError = s.error_id; toast(s.error); menuError(s.error); }
   if (s.phase === "working") {
     $("workTitle").textContent = s.kind === "newgame" ? "Choosing and naming objects\u2026" : "Finding the objects\u2026";
+    updateJobProgress(s);
     view("working");
     setTimeout(poll, 600);
     return;
@@ -771,6 +843,8 @@ function updateProgress(found, total) {
 async function loadGame() {
   game = await api("/api/game");
   gameId = game.game_id;
+  setImageZoom(1);
+  $("imageViewport").scrollTo(0, 0);
   $("photo").src = "/api/image?g=" + gameId;
   $("overlays").innerHTML = "";
   $("cheatLayer").hidden = !game.cheat;
@@ -786,6 +860,13 @@ async function loadGame() {
   game.found.forEach(addOverlay);
   updateProgress(game.found.length, game.items.length);
   $("resume").hidden = false;
+}
+function setImageZoom(value) {
+  imageZoom = Math.max(MIN_IMAGE_ZOOM, Math.min(MAX_IMAGE_ZOOM, value));
+  $("stage").style.transform = "scale(" + imageZoom + ")";
+  $("zoomLevel").textContent = Math.round(imageZoom * 100) + "%";
+  $("zoomOut").disabled = imageZoom <= MIN_IMAGE_ZOOM;
+  $("zoomIn").disabled = imageZoom >= MAX_IMAGE_ZOOM;
 }
 async function onStageClick(ev) {
   const r = $("stage").getBoundingClientRect();
@@ -817,6 +898,12 @@ $("photoFile").addEventListener("change", () => {
 $("start").addEventListener("click", start);
 $("cancel").addEventListener("click", cancel);
 $("stage").addEventListener("click", onStageClick);
+$("zoomIn").addEventListener("click", () => setImageZoom(imageZoom + IMAGE_ZOOM_STEP));
+$("zoomOut").addEventListener("click", () => setImageZoom(imageZoom - IMAGE_ZOOM_STEP));
+$("zoomReset").addEventListener("click", () => {
+  setImageZoom(1);
+  $("imageViewport").scrollTo(0, 0);
+});
 $("newGame").addEventListener("click", newGame);
 $("toMenu").addEventListener("click", () => view("menu"));
 $("resume").addEventListener("click", () => view("game"));
@@ -864,6 +951,12 @@ def main():
     parser.add_argument("--no-browser", action="store_true", help="don't open the browser automatically")
     cli = parser.parse_args()
 
+    ip = None
+    if cli.host not in ("127.0.0.1", "localhost", "::1"):
+        ip = lan_address()
+        if ip:
+            app.config["PHONE_URL"] = f"http://{ip}:{cli.port}/"
+
     threading.Thread(target=SESSION.load_modules, daemon=True).start()
     url = f"http://127.0.0.1:{cli.port}/"
     if not cli.no_browser:
@@ -871,7 +964,6 @@ def main():
     logging.getLogger("werkzeug").setLevel(logging.WARNING)   # no log line for every progress poll
     print(f"Hidden Object Game is running at {url}")
     if cli.host not in ("127.0.0.1", "localhost", "::1"):
-        ip = lan_address()
         print()
         print("Phones and tablets on the same Wi-Fi can play too. Open this address on the phone:")
         print(f"    http://{ip or '<this computer address>'}:{cli.port}/")
@@ -879,7 +971,7 @@ def main():
         print("processor. If Windows asks, allow Python through the firewall for PRIVATE networks only.")
         print("Everyone connected shares the same game. Only this computer can stop the program.")
         print()
-    print("Leave this window open while you play. Use the Quit button on the page (or Ctrl+C here) to stop.")
+    print("Use the Quit button on the page (or Ctrl+C here) to stop.")
     app.run(host=cli.host, port=cli.port, threaded=True, debug=False)
 
 

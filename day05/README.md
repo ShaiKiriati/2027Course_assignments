@@ -72,13 +72,13 @@ It lists what is installed, whether a GPU is found, whether you are logged in, a
 
 ## 5. Play
 
-**Windows:** double-click `play_hidden_objects_web.bat`. If it cannot find the conda environment, it tells you what to edit.
+**Windows:** double-click `play_hidden_objects_web.bat`. The game opens in your browser without leaving a terminal window open. If the launcher cannot find the conda environment, it tells you what to edit.
 
 **Any system:**
 ```
 python hidden_objects_web.py
 ```
-Your browser opens the game at http://127.0.0.1:5000. Leave the terminal window open while you play, and use **Quit** on the page to stop.
+Your browser opens the game at http://127.0.0.1:5000. When started this way, keep the terminal window open while you play, and use **Quit** on the page to stop.
 
 There is also a desktop-window version (`python hidden_objects_app.py`, or `play_hidden_objects.bat`). It needs tkinter, which comes with conda, and with Python from python.org on Windows and macOS. On Debian or Ubuntu, install it with `sudo apt install python3-tk`.
 
@@ -86,8 +86,8 @@ There is also a desktop-window version (`python hidden_objects_app.py`, or `play
 
 The game can run on your computer while you play on a phone or tablet on the **same Wi-Fi network**:
 
-1. Start it with `python hidden_objects_web.py --host 0.0.0.0` (Windows: double-click `play_hidden_objects_phone.bat`).
-2. The terminal prints an address such as `http://192.168.1.20:5000/`. Open it in the phone's browser.
+1. Start it with `python hidden_objects_web.py --host 0.0.0.0` (Windows: double-click `play_hidden_objects_phone.bat`, which runs without a terminal window).
+2. The web page shows the address to open in the phone's browser.
 3. On Windows, if a firewall window appears, allow Python on **private** networks only.
 
 The phone's photo picker offers the camera and photo library. The computer still does all the work, so the speed is the computer's speed.
@@ -96,7 +96,7 @@ Only do this on a network you trust (not public Wi-Fi): anyone on the network ca
 
 ### How to play
 
-Choose a photo, pick a kind of game, and press **Start game**. The first run on a new photo takes a while, and the page shows what is happening. Click objects in the photo to find them: their names are struck off the list and they are darkened. Press **N** for a new game with a fresh random set of objects from the same photo.
+Choose a photo, pick a kind of game, and press **Start game**. The first run on a new photo takes a while; the page shows the current step and a progress bar instead of raw console output. The bar shows a percentage when the app has a measurable item count, and animates while a model is loading or work cannot be measured. Click objects in the photo to find them: their names are struck off the list and they are darkened. Press **N** for a new game with a fresh random set of objects from the same photo.
 
 Results are saved per photo, so a photo you have played before starts almost immediately. They are stored in `.cache/sam3_hidden_objects` in your user folder; delete that folder to clear them.
 
@@ -130,6 +130,6 @@ Results are saved per photo, so a photo you have played before starts almost imm
 | `segment_then_name.py` | The open-ended game |
 | `requirements.txt`, `environment.yml` | Dependencies |
 | `check_setup.py` | Checks your installation |
-| `play_hidden_objects_web.bat`, `play_hidden_objects_phone.bat`, `play_hidden_objects.bat` | Windows launchers (web, web for phones on your Wi-Fi, and desktop versions) |
+| `play_hidden_objects_web.bat`, `play_hidden_objects_phone.bat`, `play_hidden_objects.bat` | Windows launchers (web without a terminal, web for phones on your Wi-Fi without a terminal, and desktop versions) |
 
 The models are the property of their authors and are downloaded from Hugging Face under their own licenses. Read the license on each model page before sharing or using the game beyond personal use.

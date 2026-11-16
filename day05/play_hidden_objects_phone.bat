@@ -2,7 +2,7 @@
 rem Starts the Hidden Object Game so that a PHONE on the same Wi-Fi can play too, using the conda environment "sam3-objects".
 rem Keep this file in the same folder as hidden_objects_web.py, segment_and_name_sam3.py and segment_then_name.py.
 setlocal
-set "ENV_NAME=sam3-objects"
+set "ENV_NAME=web-obj-game"
 set "PYEXE="
 
 rem If conda is installed somewhere unusual, put the full path to the environment's python.exe here:
@@ -23,7 +23,11 @@ if not defined PYEXE (
   exit /b 1
 )
 
-echo Starting the game. Your browser opens here, and the phone address is shown below.
-echo Leave this window open while you play. Use the Quit button on the page to stop.
-"%PYEXE%" "%~dp0hidden_objects_web.py" --host 0.0.0.0
-if errorlevel 1 pause
+for %%F in ("%PYEXE%") do set "PYWEXE=%%~dpFpythonw.exe"
+if not exist "%PYWEXE%" (
+  echo Could not find pythonw.exe next to "%PYEXE%".
+  pause
+  exit /b 1
+)
+
+start "" "%PYWEXE%" "%~dp0hidden_objects_web.py" --host 0.0.0.0
