@@ -296,6 +296,25 @@ class Session:
                           done=len(self.found) == len(self.chosen) and len(self.chosen) > 0)
             return result
 
+    def clue(self, game_id):
+        with self.lock:
+            if self.image is None or game_id != self.game_id:
+                raise Stale("This game has changed. Reload the page.")
+            remaining = [i for i in range(len(self.chosen)) if i not in self.found]
+            if not remaining:
+                return {"clue": None}
+
+            idx = int(np.random.choice(remaining))
+            mask = self.chosen[idx].mask
+            ys, xs = np.nonzero(mask)
+            point = int(np.random.randint(len(xs)))
+            h, w = mask.shape
+            side = min(max(1, int(min(w, h) * 0.2)), w, h)
+            left = min(max(0, int(xs[point] - side / 2)), w - side)
+            top = min(max(0, int(ys[point] - side / 2)), h - side)
+            return {"clue": {"x": left / w, "y": top / h,
+                             "width": side / w, "height": side / h}}
+
     def overlay_png(self, game_id, idx):
         with self.lock:
             if game_id != self.game_id or not 0 <= idx < len(self.chosen):
@@ -460,6 +479,17 @@ def api_click():
         return jsonify(error=str(e)), 409
 
 
+@app.post("/api/clue")
+def api_clue():
+    body = request.get_json(silent=True) or {}
+    try:
+        return jsonify(SESSION.clue(int(body["game_id"])))
+    except (KeyError, TypeError, ValueError):
+        return jsonify(error="Bad clue request."), 400
+    except Stale as e:
+        return jsonify(error=str(e)), 409
+
+
 @app.get("/api/overlay/<int:game_id>/<int:idx>.png")
 def api_overlay(game_id, idx):
     data = SESSION.overlay_png(game_id, idx)
@@ -517,6 +547,8 @@ INDEX_HTML = r"""<!doctype html>
   button.primary { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
   button:disabled { opacity:.5; cursor:default; }
   button.link { border:none; background:none; color:var(--muted); padding:4px 8px; }
+  button.danger { background:#c62828; border-color:#c62828; color:#fff; font-weight:600; }
+  button.danger:hover { background:#a91f1f; border-color:#a91f1f; }
   .actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px; }
   .spacer { flex:1; }
   #photoPreview { max-height:90px; max-width:160px; border-radius:6px; vertical-align:middle; margin-left:10px; }
@@ -525,6 +557,7 @@ INDEX_HTML = r"""<!doctype html>
   #stage { position:relative; display:inline-block; max-width:100%; cursor:pointer; line-height:0; user-select:none; -webkit-user-select:none; touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
   #photo { display:block; max-width:100%; max-height:68vh; width:auto; height:auto; border-radius:6px; }
   #stage img.ov { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  #clueBox { position:absolute; border:4px solid #ffd400; border-radius:4px; background:rgba(255,212,0,.14); box-shadow:0 0 0 2px rgba(0,0,0,.55); pointer-events:none; z-index:2; }
   #imageViewport { max-width:100%; max-height:68vh; overflow:auto; }
   #stage { transform-origin:top left; }
   #zoomLevel { min-width:4em; text-align:center; }
@@ -538,7 +571,7 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <header>
   <h1>Hidden Object Game</h1>
-  <button class="link" id="quit" title="Stop the program">Quit</button>
+  <button class="danger" id="quit" title="Stop the program">Quit</button>
 </header>
 <div id="toast" hidden></div>
 <main>
@@ -575,7 +608,7 @@ INDEX_HTML = r"""<!doctype html>
           <div id="groupBoxes" style="padding-left:22px"></div>
         </div>
         <div class="card" id="speedBox" style="margin-top:12px">
-          <h2>Speed and quality (word list game)</h2>
+          <h2>Speed and quality (SAM3)</h2>
           <label class="row"><input type="checkbox" id="fast" checked> Fast mode (lower resolution; good on a CPU)</label>
           <label class="row"><input type="checkbox" id="half"> Half precision (NVIDIA graphics cards only)</label>
           <label class="num">Stop after this many objects (0 = all) <input type="number" id="pool" min="0" max="500" value="30"></label>
@@ -629,12 +662,14 @@ INDEX_HTML = r"""<!doctype html>
       <span id="zoomLevel" class="note" aria-live="polite">100%</span>
       <button id="zoomIn" type="button" aria-label="Zoom in" title="Zoom in">+</button>
       <button id="zoomReset" type="button">Reset zoom</button>
+      <button id="clue" type="button">Clue</button>
     </div>
     <div id="imageViewport">
       <div id="stage">
         <img id="photo" alt="The photo to search" draggable="false">
         <img id="cheatLayer" class="ov" alt="" hidden>
         <div id="overlays"></div>
+        <div id="clueBox" hidden aria-hidden="true"></div>
       </div>
     </div>
     <ul id="items"></ul>
@@ -826,6 +861,7 @@ function addOverlay(i) {
   $("overlays").appendChild(img);
 }
 function updateProgress(found, total) {
+  $("clue").disabled = total === 0 || found === total;
   const banner = $("banner");
   if (total === 0) {
     $("progress").textContent = "No objects to find";
@@ -843,6 +879,7 @@ function updateProgress(found, total) {
 async function loadGame() {
   game = await api("/api/game");
   gameId = game.game_id;
+  $("clueBox").hidden = true;
   setImageZoom(1);
   $("imageViewport").scrollTo(0, 0);
   $("photo").src = "/api/image?g=" + gameId;
@@ -868,6 +905,25 @@ function setImageZoom(value) {
   $("zoomOut").disabled = imageZoom <= MIN_IMAGE_ZOOM;
   $("zoomIn").disabled = imageZoom >= MAX_IMAGE_ZOOM;
 }
+async function showClue() {
+  const button = $("clue");
+  button.disabled = true;
+  try {
+    const res = await api("/api/clue", { method: "POST", headers: { "Content-Type": "application/json" },
+                                         body: JSON.stringify({ game_id: gameId }) });
+    const box = $("clueBox");
+    if (res.clue) {
+      box.style.left = (res.clue.x * 100) + "%";
+      box.style.top = (res.clue.y * 100) + "%";
+      box.style.width = (res.clue.width * 100) + "%";
+      box.style.height = (res.clue.height * 100) + "%";
+      box.hidden = false;
+    } else {
+      box.hidden = true;
+    }
+  } catch (e) { toast(e.message); }
+  finally { button.disabled = game.found.length === game.items.length; }
+}
 async function onStageClick(ev) {
   const r = $("stage").getBoundingClientRect();
   const x = (ev.clientX - r.left) / r.width, y = (ev.clientY - r.top) / r.height;
@@ -879,6 +935,7 @@ async function onStageClick(ev) {
       addOverlay(res.hit);
       $("item" + res.hit).classList.add("found");
       game.found.push(res.hit);
+      $("clueBox").hidden = true;
       updateProgress(res.found, res.total);
     }
   } catch (e) { toast(e.message); }
@@ -904,6 +961,7 @@ $("zoomReset").addEventListener("click", () => {
   setImageZoom(1);
   $("imageViewport").scrollTo(0, 0);
 });
+$("clue").addEventListener("click", showClue);
 $("newGame").addEventListener("click", newGame);
 $("toMenu").addEventListener("click", () => view("menu"));
 $("resume").addEventListener("click", () => view("game"));
