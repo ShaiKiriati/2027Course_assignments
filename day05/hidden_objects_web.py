@@ -551,6 +551,7 @@ INDEX_HTML = r"""<!doctype html>
   #quit:hover { background:#a91f1f; border-color:#a91f1f; }
   #clue { background:#ffd400; border-color:#ffd400; color:#1c2230; font-weight:600; }
   #clue:hover { background:#e6bf00; border-color:#e6bf00; }
+  #clue:disabled { opacity:1; }
   .actions { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:12px; }
   .spacer { flex:1; }
   #photoPreview { max-height:90px; max-width:160px; border-radius:6px; vertical-align:middle; margin-left:10px; }
