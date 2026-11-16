@@ -1,0 +1,23 @@
+# Hidden Object Game: Python dependencies
+# Python 3.10 to 3.12 is recommended (3.11 is a good choice).
+#
+# Install with:   pip install -r requirements.txt
+#
+# NVIDIA GPU? Install PyTorch FIRST from the selector at
+#   https://pytorch.org/get-started/locally/
+# (choose Pip and your CUDA version), then run the command above. pip will see that
+# torch is already installed and keep that GPU build. A plain "pip install torch" on
+# Windows gives a CPU-only build.
+
+torch>=2.4
+torchvision
+transformers>=5.0,<6      # SAM 3 (Sam3Model) and SmolVLM need transformers 5
+accelerate
+pillow>=10
+numpy>=1.26
+matplotlib>=3.7
+flask>=3.0                # only needed for the web version (hidden_objects_web.py)
+
+# Not installed by pip: tkinter, needed only by the desktop launcher
+# (hidden_objects_app.py). It comes with python.org and conda Pythons on Windows and
+# macOS; on Debian/Ubuntu install it with:  sudo apt install python3-tk

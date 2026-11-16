@@ -2,7 +2,7 @@
 rem Starts the Hidden Object Game (web version, opens in your browser) using the conda environment "sam3-objects".
 rem Keep this file in the same folder as hidden_objects_web.py, segment_and_name_sam3.py and segment_then_name.py.
 setlocal
-set "ENV_NAME=sam3-objects"
+set "ENV_NAME=web-obj-game"
 set "PYEXE="
 
 rem If conda is installed somewhere unusual, put the full path to the environment's python.exe here:
