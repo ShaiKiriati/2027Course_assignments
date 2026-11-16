@@ -5,8 +5,8 @@ Hidden Object Game, open-ended version: segment first, name afterwards.
 1. SAM (SAM 3 by default) segments everything it can find in the photo, with no
    word list involved.
 2. Each game picks 5-20 of those segments at random and names only those:
-   - "vlm" (default): a small vision-language model looks at each segment and says
-     what it is, in its own words (open-ended names).
+   - "vlm" (default): a small vision-language model sees the full photo with the
+     segment highlighted, plus a close-up, and gives it an open-ended name.
    - "clip": CLIP picks the best match from the word groups (much faster).
 3. The names become the list in the game window. Click objects to find them.
    Press N for a new game: new random segments are picked and named.
@@ -49,8 +49,11 @@ CLIP_MIN_CONF = 0.15    # --namer clip: reject names CLIP is unsure about
 VLM_CROP_SIZE = 384     # segments are shown to the VLM at this size
 CACHE_VERSION = 1
 REJECT_LABELS = ["background", "blurry background", "a small part of something", "a shadow", "a texture"]
-VLM_PROMPT = ("What is the main object in the middle of this image? Answer with its name only, in one to "
-              "three words. If it is only background, a texture or a fragment, answer: unclear")
+VLM_PROMPT = ("You are shown two images of the same photo: first the full scene with the target segment "
+              "highlighted in orange, then a close-up of that segment with everything outside its mask "
+              "grayed out. Name only the object represented by the highlighted segment, using the full "
+              "scene to understand its context. Give a short noun phrase of one to three words. If the "
+              "segment is only a fragment, background, or ambiguous, do not guess; answer exactly: unclear")
 
 BAD_NAMES = {"unclear", "unknown", "none", "nothing", "background", "image", "picture", "photo",
              "texture", "pattern", "n/a", "na", "object", "item", "thing", "something"}
@@ -112,6 +115,14 @@ def crop_segment(image_arr, mask):
     return Image.fromarray(canvas)
 
 
+def highlight_segment(image_arr, mask):
+    """Tint a segment in the full photo so the VLM can use its scene context."""
+    highlighted = image_arr.copy()
+    tint = np.array([255, 128, 0], dtype=np.float32)
+    highlighted[mask] = (highlighted[mask].astype(np.float32) * 0.4 + tint * 0.6).astype(np.uint8)
+    return Image.fromarray(highlighted)
+
+
 # --------------------------------------------------------------------------
 # Naming
 # --------------------------------------------------------------------------
@@ -149,7 +160,7 @@ def load_vlm(model_id, device):
 
 
 class VlmNamer:
-    """Open-ended naming: a small vision-language model says what each segment is."""
+    """Open-ended naming with both full-scene context and a masked segment close-up."""
 
     def __init__(self, model_id, device):
         print(f"Loading the naming model {model_id}...")
@@ -158,23 +169,26 @@ class VlmNamer:
         self.model = load_vlm(model_id, device)
 
     @torch.no_grad()
-    def name_one(self, crop):
-        image = crop.resize((VLM_CROP_SIZE, VLM_CROP_SIZE))
-        messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": VLM_PROMPT}]}]
+    def name_one(self, context_image, crop):
+        images = [context_image.resize((VLM_CROP_SIZE, VLM_CROP_SIZE)),
+                  crop.resize((VLM_CROP_SIZE, VLM_CROP_SIZE))]
+        messages = [{"role": "user", "content": [
+            {"type": "image"}, {"type": "image"}, {"type": "text", "text": VLM_PROMPT}
+        ]}]
         prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
-        inputs = self.processor(text=prompt, images=[image], return_tensors="pt").to(self.device)
+        inputs = self.processor(text=prompt, images=images, return_tensors="pt").to(self.device)
         if "pixel_values" in inputs:
             inputs["pixel_values"] = inputs["pixel_values"].to(self.model.dtype)
         out = self.model.generate(**inputs, max_new_tokens=8, do_sample=False)
         text = self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
         return clean_name(text)
 
-    def name_crops(self, crops, stop_event=None):
+    def name_crops(self, crops, context_images, stop_event=None):
         names = []
-        for k, crop in enumerate(crops, 1):
+        for k, (crop, context_image) in enumerate(zip(crops, context_images), 1):
             if stop_event is not None and stop_event.is_set():
                 raise Cancelled()
-            names.append(self.name_one(crop))
+            names.append(self.name_one(context_image, crop))
             print(f"  {k}/{len(crops)}: {names[-1] or '(not a clear object, skipped)'}")
         return names
 
@@ -330,7 +344,12 @@ def prepare(path, args, stop_event=None):
             return
         print(f"Naming {len(todo)} segments...")
         crops = [crop_segment(image_arr, i.mask) for i in todo]
-        for inst, name in zip(todo, backend.name_crops(crops, stop)):
+        if args.namer == "vlm":
+            context_images = [highlight_segment(image_arr, i.mask) for i in todo]
+            names = backend.name_crops(crops, context_images, stop)
+        else:
+            names = backend.name_crops(crops, stop)
+        for inst, name in zip(todo, names):
             inst.name = name
         if names_file:
             save_names(names_file, instances)
