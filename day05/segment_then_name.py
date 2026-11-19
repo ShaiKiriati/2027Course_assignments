@@ -5,8 +5,8 @@ Hidden Object Game, open-ended version: segment first, name afterwards.
 1. SAM (SAM 3 by default) segments everything it can find in the photo, with no
    word list involved.
 2. Each game picks 5-20 of those segments at random and names only those:
-   - "vlm" (default): a small vision-language model sees the full photo with the
-     segment highlighted, plus a close-up, and gives it an open-ended name.
+   - "vlm" (default): a vision-language model sees the full photo with the
+     segment highlighted, plus a close-up, names it, then verifies the proposed name.
    - "clip": CLIP picks the best match from the word groups (much faster).
 3. The names become the list in the game window. Click objects to find them.
    Press N for a new game: new random segments are picked and named.
@@ -18,13 +18,16 @@ Setup (same environment as the other version):
 
 Run:
     python segment_then_name.py photo.jpg
+    python segment_then_name.py photo.jpg --vlm-size 256M
     python segment_then_name.py photo.jpg --namer clip --groups bathroom,toys
+    python segment_then_name.py photo.jpg --clip-diagnostic
     python segment_then_name.py photo.jpg --sam-model facebook/sam2.1-hiera-small   # no gated model, faster
 """
 import argparse
 import hashlib
 import json
 import re
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -38,7 +41,11 @@ from segment_and_name_sam3 import (CONCEPT_GROUPS, Cancelled, Instance, choose_f
                                    detect_groups, load_concepts, pick_device, show)
 
 SAM_MODEL = "facebook/sam3"                       # segmentation; also works: facebook/sam2.1-hiera-small
-VLM_MODEL = "HuggingFaceTB/SmolVLM-256M-Instruct"  # open-ended naming (500M version: better, slower)
+VLM_MODELS = {
+    "500M": "HuggingFaceTB/SmolVLM-500M-Instruct",
+    "256M": "HuggingFaceTB/SmolVLM-256M-Instruct",
+}
+DEFAULT_VLM_SIZE = "500M"
 CLIP_MODEL = "openai/clip-vit-large-patch14"       # naming with --namer clip
 DEFAULT_GRID = 24       # SAM prompts a grid of GRID x GRID points; more = finds smaller things, slower
 MAX_SIDE = base.MAX_SIDE
@@ -46,7 +53,8 @@ MAX_SEGMENTS = 80       # keep the best-scoring segments only
 MIN_AREA, MAX_AREA = 0.004, 0.60   # allowed segment size (fraction of the image)
 NMS_IOU = 0.6           # drop near-duplicate segments
 CLIP_MIN_CONF = 0.15    # --namer clip: reject names CLIP is unsure about
-VLM_CROP_SIZE = 384     # segments are shown to the VLM at this size
+CROP_PADDING = 0.05     # fraction of the segment bounding box to include around the mask
+VLM_CROP_SIZE = 512     # images shown to the VLM at this size
 CACHE_VERSION = 1
 REJECT_LABELS = ["background", "blurry background", "a small part of something", "a shadow", "a texture"]
 VLM_PROMPT = ("You are shown two images of the same photo: first the full scene with the target segment "
@@ -54,6 +62,19 @@ VLM_PROMPT = ("You are shown two images of the same photo: first the full scene 
               "grayed out. Name only the object represented by the highlighted segment, using the full "
               "scene to understand its context. Give a short noun phrase of one to three words. If the "
               "segment is only a fragment, background, or ambiguous, do not guess; answer exactly: unclear")
+VLM_VERIFY_PROMPT = ("The first image shows the full scene with a target segment highlighted in orange. "
+                     "The second image is a close-up of that segment. The proposed name is {name!r}. "
+                     "Does the highlighted segment clearly depict that object? Judge the segment itself, "
+                     "using the scene only for context. Answer with exactly one word: yes, no, or unclear. "
+                     "Use no if the name does not match the segment, and unclear if there is not enough "
+                     "visual evidence.")
+QUALITY_PROMPT_TEMPLATES = (
+    "{word}",
+    "a photo of {word}",
+    "the {word} in the scene",
+    "the visible {word}",
+    "a segment showing {word}",
+)
 
 BAD_NAMES = {"unclear", "unknown", "none", "nothing", "background", "image", "picture", "photo",
              "texture", "pattern", "n/a", "na", "object", "item", "thing", "something"}
@@ -103,7 +124,7 @@ def crop_segment(image_arr, mask):
     """Crop the segment's bounding box, grey out everything else, pad to a square."""
     ys, xs = np.where(mask)
     y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
-    pad_y, pad_x = int((y1 - y0) * 0.1), int((x1 - x0) * 0.1)
+    pad_y, pad_x = int((y1 - y0) * CROP_PADDING), int((x1 - x0) * CROP_PADDING)
     y0, y1 = max(0, y0 - pad_y), min(mask.shape[0], y1 + pad_y)
     x0, x1 = max(0, x0 - pad_x), min(mask.shape[1], x1 + pad_x)
     patch = np.where(mask[..., None], image_arr, 128).astype(np.uint8)[y0:y1, x0:x1]
@@ -162,34 +183,55 @@ def load_vlm(model_id, device):
 class VlmNamer:
     """Open-ended naming with both full-scene context and a masked segment close-up."""
 
-    def __init__(self, model_id, device):
+    def __init__(self, model_id, device, clip_diagnostic=None):
         print(f"Loading the naming model {model_id}...")
         self.device = device
+        self.clip_diagnostic = clip_diagnostic
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = load_vlm(model_id, device)
 
     @torch.no_grad()
-    def name_one(self, context_image, crop):
-        images = [context_image.resize((VLM_CROP_SIZE, VLM_CROP_SIZE)),
-                  crop.resize((VLM_CROP_SIZE, VLM_CROP_SIZE))]
+    def _ask(self, context_image, crop, question, max_new_tokens):
+        context = ImageOps.pad(context_image, (VLM_CROP_SIZE, VLM_CROP_SIZE),
+                               method=Image.Resampling.LANCZOS, color=(128, 128, 128))
+        images = [context, crop.resize((VLM_CROP_SIZE, VLM_CROP_SIZE),
+                                        resample=Image.Resampling.LANCZOS)]
         messages = [{"role": "user", "content": [
-            {"type": "image"}, {"type": "image"}, {"type": "text", "text": VLM_PROMPT}
+            {"type": "image"}, {"type": "image"}, {"type": "text", "text": question}
         ]}]
         prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
         inputs = self.processor(text=prompt, images=images, return_tensors="pt").to(self.device)
         if "pixel_values" in inputs:
             inputs["pixel_values"] = inputs["pixel_values"].to(self.model.dtype)
-        out = self.model.generate(**inputs, max_new_tokens=8, do_sample=False)
-        text = self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
-        return clean_name(text)
+        out = self.model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        return self.processor.batch_decode(out[:, inputs["input_ids"].shape[1]:],
+                                           skip_special_tokens=True)[0]
+
+    def name_one(self, context_image, crop):
+        return clean_name(self._ask(context_image, crop, VLM_PROMPT, max_new_tokens=8))
+
+    def verify_name(self, context_image, crop, name):
+        answer = self._ask(context_image, crop, VLM_VERIFY_PROMPT.format(name=name), max_new_tokens=4)
+        token = answer.strip().lower().strip(" .,:;!?\"'`*_").split(maxsplit=1)
+        return bool(token and token[0] == "yes"), answer
 
     def name_crops(self, crops, context_images, stop_event=None):
         names = []
         for k, (crop, context_image) in enumerate(zip(crops, context_images), 1):
             if stop_event is not None and stop_event.is_set():
                 raise Cancelled()
-            names.append(self.name_one(context_image, crop))
-            print(f"  {k}/{len(crops)}: {names[-1] or '(not a clear object, skipped)'}")
+            name = self.name_one(context_image, crop)
+            if name:
+                if self.clip_diagnostic is not None:
+                    rank, total, alternatives = self.clip_diagnostic.diagnose_name(crop, name)
+                    top = ", ".join(f"{label} ({score:.1f})" for label, score in alternatives)
+                    print(f"  CLIP diagnostic: {name!r} ranked {rank}/{total}; alternatives: {top}")
+                supported, answer = self.verify_name(context_image, crop, name)
+                if not supported:
+                    print(f"  {k}/{len(crops)}: {name!r} rejected by verifier ({answer!r})")
+                    name = ""
+            names.append(name)
+            print(f"  {k}/{len(crops)}: {name or '(not a clear object, skipped)'}")
         return names
 
 
@@ -197,15 +239,28 @@ class ClipNamer:
     """Fast naming: CLIP picks the best match from a vocabulary (the word groups)."""
 
     def __init__(self, clip_name, vocab, device, min_conf):
-        print(f"Loading CLIP ({clip_name}) with {len(vocab)} names...")
+        print(f"Loading CLIP ({clip_name}) with {len(vocab)} names on {device}...")
         self.device, self.vocab, self.min_conf = device, vocab, min_conf
         self.model = CLIPModel.from_pretrained(clip_name).to(device).eval()
         self.processor = CLIPProcessor.from_pretrained(clip_name)
         self.prompts = [f"a photo of a {w}" for w in vocab + REJECT_LABELS]
 
     @torch.no_grad()
+    def diagnose_name(self, crop, name):
+        labels = [name] + [label for label in self.vocab + REJECT_LABELS
+                           if label.casefold() != name.casefold()]
+        prompts = [f"a photo of a {label}" for label in labels]
+        inputs = self.processor(text=prompts, images=crop, return_tensors="pt", padding=True).to(self.device)
+        scores = self.model(**inputs).logits_per_image[0].detach().float().cpu().numpy()
+        rank = int(np.count_nonzero(scores[1:] >= scores[0])) + 1
+        best = np.argsort(scores[1:])[-3:][::-1]
+        alternatives = [(labels[i + 1], float(scores[i + 1])) for i in best]
+        return rank, len(labels), alternatives
+
+    @torch.no_grad()
     def name_crops(self, crops, stop_event=None):
         names = []
+        total = len(crops)
         for start in range(0, len(crops), 8):
             if stop_event is not None and stop_event.is_set():
                 raise Cancelled()
@@ -215,8 +270,118 @@ class ClipNamer:
             for row in softmax(logits):
                 k = int(row.argmax())
                 names.append(self.vocab[k] if k < len(self.vocab) and row[k] >= self.min_conf else "")
-        print("  named: " + ", ".join(n or "(skipped)" for n in names))
+                print(f"  {len(names)}/{total}: {names[-1] or '(skipped)'}")
         return names
+
+
+def _match_quality_masks(target_indices, targets, detected_masks, detected_scores):
+    pairs = []
+    for target_index in target_indices:
+        for detection_index, detection_mask in enumerate(detected_masks):
+            overlap = mask_iou(targets[target_index].mask, detection_mask)
+            if overlap > 0:
+                pairs.append((overlap, target_index, detection_index))
+    pairs.sort(key=lambda pair: pair[0], reverse=True)
+
+    matches, used_targets, used_detections = {}, set(), set()
+    for overlap, target_index, detection_index in pairs:
+        if target_index in used_targets or detection_index in used_detections:
+            continue
+        matches[target_index] = (overlap, detected_scores[detection_index])
+        used_targets.add(target_index)
+        used_detections.add(detection_index)
+    return matches
+
+
+@torch.no_grad()
+def evaluate_naming_quality(image, targets, runs, device, stop_event=None):
+    """Compare chosen named masks with SAM 3 detections under prompt variations."""
+    if not targets:
+        raise ValueError("There are no named segments in the current game to evaluate.")
+    if not 1 <= runs <= len(QUALITY_PROMPT_TEMPLATES):
+        raise ValueError(f"Run count must be between 1 and {len(QUALITY_PROMPT_TEMPLATES)}.")
+
+    word_indices = {}
+    for index, inst in enumerate(targets):
+        if inst.name:
+            word_indices.setdefault(inst.name, []).append(index)
+    if not word_indices:
+        raise ValueError("The current game has no usable names to evaluate.")
+
+    results = [
+        {"segment": index + 1, "word": inst.name, "mask_area": int(inst.mask.sum()), "runs": []}
+        for index, inst in enumerate(targets)
+    ]
+
+    print(f"Starting SAM3 quality check: {len(targets)} segments, {runs} prompt runs")
+    model = base.load_model(device, half=False, fast=False)
+    processor = base.Sam3Processor.from_pretrained(base.SAM3_MODEL)
+    image_inputs = processor(images=image, return_tensors="pt").to(device)
+    vision_embeds = model.get_vision_features(pixel_values=image_inputs.pixel_values.to(model.dtype))
+    base.sync(device)
+    target_sizes = image_inputs.get("original_sizes").tolist()
+    word_count = len(word_indices)
+
+    for run_index, template in enumerate(QUALITY_PROMPT_TEMPLATES[:runs], 1):
+        for word_index, (word, indices) in enumerate(word_indices.items(), 1):
+            if stop_event is not None and stop_event.is_set():
+                raise Cancelled()
+            prompt = template.format(word=word)
+            text_inputs = processor(text=prompt, return_tensors="pt").to(device)
+            outputs = model(vision_embeds=vision_embeds, **text_inputs)
+            res = processor.post_process_instance_segmentation(
+                outputs, threshold=0.5, mask_threshold=0.5, target_sizes=target_sizes,
+            )[0]
+            detected_masks = [mask.detach().cpu().numpy().astype(bool) for mask in res["masks"]]
+            detected_scores = [float(score) for score in res["scores"]]
+            limit = max(base.DEFAULT_MAX_PER_CONCEPT, len(indices))
+            order = sorted(range(len(detected_scores)), key=detected_scores.__getitem__, reverse=True)[:limit]
+            detected_masks = [detected_masks[i] for i in order]
+            detected_scores = [detected_scores[i] for i in order]
+            matches = _match_quality_masks(indices, targets, detected_masks, detected_scores)
+
+            for index in indices:
+                iou, confidence = matches.get(index, (0.0, 0.0))
+                score = 100 * iou * confidence
+                results[index]["runs"].append({
+                    "run": run_index,
+                    "prompt": prompt,
+                    "iou": round(iou, 4),
+                    "sam3_confidence": round(confidence, 4),
+                    "score": round(score, 2),
+                })
+            print(f"Quality run {run_index}/{runs}: word {word_index}/{word_count} complete - {word}")
+
+    for result in results:
+        run_results = result["runs"]
+        result["mean_iou"] = round(sum(item["iou"] for item in run_results) / runs, 4)
+        result["mean_sam3_confidence"] = round(
+            sum(item["sam3_confidence"] for item in run_results) / runs, 4)
+        result["mean_score"] = round(sum(item["score"] for item in run_results) / runs, 2)
+
+    del model, processor, image_inputs, vision_embeds
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    return {
+        "sam3_model": base.SAM3_MODEL,
+        "runs": runs,
+        "prompt_templates": list(QUALITY_PROMPT_TEMPLATES[:runs]),
+        "score_definition": "Mean of 100 * mask IoU * SAM3 confidence across prompt runs.",
+        "items": results,
+    }
+
+
+def save_quality_report(image_path, image_name, cache_dir, report):
+    image_hash = hashlib.sha1(Path(image_path).read_bytes()).hexdigest()[:16]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    report_path = Path(cache_dir) / "quality_reports" / f"naming_quality_{image_hash}_{timestamp}.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    saved_report = dict(report)
+    saved_report["image_name"] = image_name or Path(image_path).name
+    saved_report["image_sha1"] = image_hash
+    saved_report["saved_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    report_path.write_text(json.dumps(saved_report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return report_path
 
 
 # --------------------------------------------------------------------------
@@ -269,8 +434,13 @@ def build_parser():
                    help="SAM prompts a GRID x GRID grid of points: more finds smaller objects but is slower")
     p.add_argument("--namer", choices=["vlm", "clip"], default="vlm",
                    help="vlm: open-ended names from a vision-language model; clip: pick from the word groups (faster)")
-    p.add_argument("--vlm-model", default=VLM_MODEL, help="vision-language model used by --namer vlm")
+    p.add_argument("--vlm-size", choices=tuple(VLM_MODELS), default=DEFAULT_VLM_SIZE,
+                   help="VLM size: 500M (default) or 256M (smaller and faster)")
+    p.add_argument("--vlm-model", default=None,
+                   help="custom vision-language model ID; overrides --vlm-size")
     p.add_argument("--clip-model", default=CLIP_MODEL, help="CLIP model used by --namer clip")
+    p.add_argument("--clip-diagnostic", action="store_true",
+                   help="--namer vlm: print CLIP's best competing labels (diagnostic only; runs CLIP on CPU)")
     p.add_argument("--min-confidence", type=float, default=CLIP_MIN_CONF, help="--namer clip: minimum confidence")
     p.add_argument("--groups", default="auto",
                    help="--namer clip vocabulary: 'auto' (scene recognition), 'all', or a comma-separated list "
@@ -328,8 +498,16 @@ def prepare(path, args, stop_event=None):
         backend = ClipNamer(args.clip_model, vocab, device, args.min_confidence)
         namer_id = sha({"namer": "clip", "model": args.clip_model, "vocab": vocab, "conf": args.min_confidence})
     else:
-        backend = VlmNamer(args.vlm_model, device)
-        namer_id = sha({"namer": "vlm", "model": args.vlm_model, "prompt": VLM_PROMPT})
+        vlm_model = args.vlm_model or VLM_MODELS[args.vlm_size]
+        clip_diagnostic = None
+        if args.clip_diagnostic:
+            clip_diagnostic = ClipNamer(args.clip_model, load_concepts(None, "all"), "cpu", args.min_confidence)
+        backend = VlmNamer(vlm_model, device, clip_diagnostic)
+        namer_id = sha({"namer": "vlm", "model": vlm_model, "prompt": VLM_PROMPT,
+                        "verify_prompt": VLM_VERIFY_PROMPT, "image_size": VLM_CROP_SIZE,
+                        "crop_padding": CROP_PADDING, "context_fit": "pad",
+                        "clip_diagnostic": args.clip_diagnostic,
+                        "clip_model": args.clip_model if args.clip_diagnostic else None})
     check_cancel()
 
     names_file = names_path(seg_path, namer_id) if seg_path else None
@@ -360,7 +538,10 @@ def prepare(path, args, stop_event=None):
 
 
 def main():
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.clip_diagnostic and args.namer != "vlm":
+        parser.error("--clip-diagnostic can only be used with --namer vlm")
     path = args.image or choose_file()
     if not path:
         print("No file selected.")

@@ -35,12 +35,13 @@ import re
 import socket
 import tempfile
 import threading
+import time
 import traceback
 import webbrowser
 from pathlib import Path
 
 import numpy as np
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_file
 from PIL import Image
 from werkzeug.utils import secure_filename
 
@@ -100,6 +101,22 @@ def build_args(modules, s):
         detail = int(s.get("detail", 24))
     except (TypeError, ValueError):
         raise ValueError("Please enter numbers in the number boxes.")
+    quality_check = s.get("quality_check", False)
+    if not isinstance(quality_check, bool):
+        raise ValueError("Choose whether to run the SAM3 naming quality check.")
+    quality_runs = 3
+    if quality_check:
+        raw_quality_runs = s.get("quality_runs", 3)
+        try:
+            quality_runs = int(raw_quality_runs)
+        except (TypeError, ValueError):
+            raise ValueError("Quality check runs must be a whole number between 1 and 5.")
+        if isinstance(raw_quality_runs, bool) or quality_runs != raw_quality_runs:
+            raise ValueError("Quality check runs must be a whole number between 1 and 5.")
+    if quality_check and not free:
+        raise ValueError("The SAM3 naming quality check is only available in open-ended mode.")
+    if quality_check and not 1 <= quality_runs <= 5:
+        raise ValueError("Quality check runs must be between 1 and 5.")
     naming = s.get("naming", "vlm")
     if naming not in ("vlm", "clip"):
         raise ValueError("Unknown naming method.")
@@ -127,8 +144,15 @@ def build_args(modules, s):
     args.auto_top = auto_top
     args.no_cache = not bool(s.get("use_cache", True))
     args.overlay = bool(s.get("cheat", False))
+    args.quality_check = quality_check
+    args.quality_runs = quality_runs
+    args.clip_diagnostic = free and naming == "vlm" and bool(s.get("clip_diagnostic", False))
     if free:
+        vlm_size = s.get("vlm_size", modules["free"].DEFAULT_VLM_SIZE)
+        if vlm_size not in modules["free"].VLM_MODELS:
+            raise ValueError("Choose the 500M or 256M vision-language model.")
         args.namer = naming
+        args.vlm_size = vlm_size
         args.sam_model = SAM_CHOICES.get(s.get("sam"), next(iter(SAM_CHOICES.values())))
         args.grid = detail
     else:
@@ -178,8 +202,12 @@ class LogWriter:
 class Session:
     def __init__(self):
         self.lock = threading.RLock()
-        self.phase = "loading"        # loading -> idle -> working -> ready
+        self.phase = "loading"        # loading -> idle -> working -> ready/report
         self.kind = ""                # what the background job is doing: "find" or "newgame"
+        self.job_id = 0
+        self.job_started_at = 0.0
+        self.quality_report = None
+        self.quality_report_path = None
         self.error = ""
         self.error_id = 0
         self.load_error = ""
@@ -215,6 +243,10 @@ class Session:
                 raise Busy("Please wait until the current job has finished.")
             self.phase = "working"
             self.kind = kind
+            self.job_id += 1
+            self.job_started_at = time.monotonic()
+            self.quality_report = None
+            self.quality_report_path = None
             self.log = LogBuffer()
             self.stop_event = threading.Event()
         threading.Thread(target=self._run, args=(func,), daemon=True).start()
@@ -222,11 +254,13 @@ class Session:
     def _run(self, func):
         writer = LogWriter(self)
         error = ""
+        cancelled = False
         try:
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
                 func()
         except BaseException as e:
             if isinstance(e, self.modules["list"].Cancelled):
+                cancelled = True
                 writer.write("\nCancelled.\n")
             else:
                 text = traceback.format_exc()
@@ -236,8 +270,11 @@ class Session:
             if error:
                 self.error = error
                 self.error_id += 1
-            # After a failed or cancelled job we fall back to the previous game, if there was one.
-            self.phase = "ready" if self.image is not None else "idle"
+            if not error and not cancelled and self.kind == "quality" and self.quality_report is not None:
+                self.phase = "report"
+            else:
+                # After a failed or cancelled job we fall back to the previous game, if there was one.
+                self.phase = "ready" if self.image is not None else "idle"
 
     def find_objects(self, module, path, args):
         """Job: find the objects in a photo and open the first game."""
@@ -250,6 +287,21 @@ class Session:
                 self.cheat = bool(args.overlay)
                 self.begin_game(first)
         self.start_job("find", job)
+
+    def check_naming_quality(self, module, path, args):
+        def job():
+            image, _, extras = module.prepare(path, args, self.stop_event)
+            targets = extras.get("first_game", [])
+            del extras
+            report = module.evaluate_naming_quality(
+                image, targets, args.quality_runs, self.modules["list"].pick_device(), self.stop_event)
+            report_path = module.save_quality_report(
+                path, args.quality_image_name, args.cache_dir, report)
+            with self.lock:
+                self.quality_report = report
+                self.quality_report_path = report_path
+            print(f"Saved quality report: {report_path}")
+        self.start_job("quality", job)
 
     def new_game(self):
         """Job: pick (and, in open-ended mode, name) a fresh random set of objects."""
@@ -360,7 +412,10 @@ class Session:
     def status(self):
         with self.lock:
             return {"phase": self.phase, "kind": self.kind, "log": self.log.text(), "game_id": self.game_id,
-                    "error": self.error, "error_id": self.error_id}
+                    "error": self.error, "error_id": self.error_id, "job_id": self.job_id,
+                    "elapsed_seconds": time.monotonic() - self.job_started_at if self.phase == "working" else 0,
+                    "quality_report": self.quality_report if self.phase == "report" else None,
+                    "quality_report_path": str(self.quality_report_path) if self.phase == "report" else None}
 
     def game(self):
         with self.lock:
@@ -409,6 +464,16 @@ def api_status():
     return jsonify(SESSION.status())
 
 
+@app.get("/api/quality_report")
+def api_quality_report():
+    with SESSION.lock:
+        report_path = SESSION.quality_report_path
+    if report_path is None or not report_path.is_file():
+        return jsonify(error="No saved quality report is available."), 404
+    return send_file(report_path, as_attachment=True, download_name=report_path.name,
+                     mimetype="application/json")
+
+
 @app.post("/api/start")
 def api_start():
     global upload_counter, UPLOAD_DIR
@@ -430,8 +495,12 @@ def api_start():
     upload_counter += 1
     path = UPLOAD_DIR / f"upload_{upload_counter}{suffix}"
     photo.save(path)
+    args.quality_image_name = secure_filename(photo.filename)
     try:
-        SESSION.find_objects(module, str(path), args)
+        if args.quality_check:
+            SESSION.check_naming_quality(module, str(path), args)
+        else:
+            SESSION.find_objects(module, str(path), args)
     except Busy as e:
         return jsonify(error=str(e)), 409
     return jsonify(ok=True)
@@ -557,6 +626,9 @@ INDEX_HTML = r"""<!doctype html>
   #photoPreview { max-height:90px; max-width:160px; border-radius:6px; vertical-align:middle; margin-left:10px; }
   .progress-status { margin:8px 0; }
   progress { display:block; width:100%; height:16px; accent-color:var(--accent); }
+  .quality-table-wrap { overflow-x:auto; }
+  .quality-table { border-collapse:collapse; width:100%; }
+  .quality-table th,.quality-table td { border-bottom:1px solid var(--border); padding:7px; text-align:left; vertical-align:top; }
   #stage { position:relative; display:inline-block; max-width:100%; cursor:pointer; line-height:0; user-select:none; -webkit-user-select:none; touch-action:manipulation; -webkit-tap-highlight-color:transparent; }
   #photo { display:block; max-width:100%; max-height:68vh; width:auto; height:auto; border-radius:6px; }
   #stage img.ov { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
@@ -597,6 +669,16 @@ INDEX_HTML = r"""<!doctype html>
           <h2>Open-ended mode settings</h2>
           <label class="row"><input type="radio" name="naming" value="vlm" checked> Vision-language model (open-ended names, slower)</label>
           <label class="row"><input type="radio" name="naming" value="clip"> CLIP with the word groups (faster)</label>
+          <label class="num" id="vlmSizeBox">VLM size <select id="vlmSize">
+            <option value="500M">SmolVLM-500M (default; better, slower)</option>
+            <option value="256M">SmolVLM-256M (smaller, faster)</option>
+          </select></label>
+          <label class="row" id="clipDiagnosticBox"><input type="checkbox" id="clipDiagnostic"> Print CLIP alternatives for VLM names (CPU diagnostic only)</label>
+          <div class="card" id="qualityBox" style="margin-top:10px">
+            <label class="row"><input type="checkbox" id="qualityCheck"> Run SAM3 naming quality check instead of playing</label>
+            <label class="num" id="qualityRunsBox">Prompt runs (1-5) <input type="number" id="qualityRuns" min="1" max="5" value="3"></label>
+            <p class="note">Uses SAM3 (requires model access), compares each target mask with SAM3's match, and saves a JSON report. This can take a long time.</p>
+          </div>
           <label class="num">Segmentation model <select id="sam"></select></label>
           <label class="num">Detail (points per side) <input type="number" id="detail" min="8" max="64" value="24"></label>
         </div>
@@ -645,9 +727,26 @@ INDEX_HTML = r"""<!doctype html>
     <div class="card">
       <h2 id="workTitle">Working&hellip;</h2>
       <p class="progress-status" id="jobProgressText" role="status" aria-live="polite">Preparing&hellip;</p>
-      <progress id="jobProgressBar" aria-label="Game preparation progress"></progress>
+      <progress id="jobProgressBar" max="100" aria-label="Game preparation progress"></progress>
       <div class="actions"><button id="cancel">Cancel</button>
-        <span class="note">The game opens automatically when it is ready.</span></div>
+        <span class="note" id="workNote">The game opens automatically when it is ready.</span></div>
+    </div>
+  </section>
+
+  <section id="qualityReport" hidden>
+    <div class="card">
+      <h2>SAM3 naming quality report</h2>
+      <p id="qualitySummary"></p>
+      <div class="actions">
+        <a id="qualityDownload" href="/api/quality_report" download>Download saved JSON report</a>
+        <button id="qualityBack" type="button">Back to settings</button>
+      </div>
+      <div class="quality-table-wrap">
+        <table class="quality-table">
+          <thead><tr><th>Segment</th><th>Word</th><th>Mean IoU</th><th>Mean SAM3 confidence</th><th>Mean score / 100</th><th>Prompt runs</th></tr></thead>
+          <tbody id="qualityRows"></tbody>
+        </table>
+      </div>
     </div>
   </section>
 
@@ -683,7 +782,7 @@ INDEX_HTML = r"""<!doctype html>
 const $ = id => document.getElementById(id);
 const SETTINGS_KEY = "hidden-object-game-settings-v1";
 let info = null, gameId = null, polling = false, shownError = 0, game = null, toastTimer = null;
-let imageZoom = 1;
+let imageZoom = 1, progressJobId = null, progressRates = {};
 const MIN_IMAGE_ZOOM = 1, MAX_IMAGE_ZOOM = 3, IMAGE_ZOOM_STEP = 0.25;
 
 async function api(url, opts) {
@@ -693,7 +792,7 @@ async function api(url, opts) {
   if (!r.ok) throw new Error(data.error || ("Request failed (" + r.status + ")"));
   return data;
 }
-function view(name) { for (const v of ["menu", "working", "game"]) $(v).hidden = (v !== name); }
+function view(name) { for (const v of ["menu", "working", "qualityReport", "game"]) $(v).hidden = (v !== name); }
 function radio(name) { const el = document.querySelector('input[name="' + name + '"]:checked'); return el ? el.value : null; }
 function setRadio(name, value) { const el = document.querySelector('input[name="' + name + '"][value="' + value + '"]'); if (el) el.checked = true; }
 function toast(msg) {
@@ -705,12 +804,15 @@ function menuError(msg) { const e = $("menuError"); e.textContent = msg || ""; e
 /* ---------- settings ---------- */
 function readSettings() {
   return {
-    mode: radio("mode"), naming: radio("naming"), sam: $("sam").value, detail: Number($("detail").value),
+    mode: radio("mode"), naming: radio("naming"), vlm_size: $("vlmSize").value,
+    quality_check: $("qualityCheck").checked, quality_runs: Number($("qualityRuns").value),
+    sam: $("sam").value, detail: Number($("detail").value),
     group_mode: radio("group_mode"),
     groups: [...document.querySelectorAll("#groupBoxes input:checked")].map(i => i.value),
     fast: $("fast").checked, half: $("half").checked, pool: Number($("pool").value),
     threshold: Number($("threshold").value), auto_top: Number($("auto_top").value),
-    use_cache: $("useCache").checked, cheat: $("cheat").checked
+    use_cache: $("useCache").checked, cheat: $("cheat").checked,
+    clip_diagnostic: $("clipDiagnostic").checked
   };
 }
 function applySettings(s) {
@@ -718,11 +820,15 @@ function applySettings(s) {
   if (s.mode) setRadio("mode", s.mode);
   if (s.naming) setRadio("naming", s.naming);
   if (s.group_mode) setRadio("group_mode", s.group_mode);
+  if (s.vlm_size && [...$("vlmSize").options].some(o => o.value === s.vlm_size)) $("vlmSize").value = s.vlm_size;
   if (s.sam && [...$("sam").options].some(o => o.value === s.sam)) $("sam").value = s.sam;
-  for (const [id, key] of [["detail", "detail"], ["pool", "pool"], ["threshold", "threshold"], ["auto_top", "auto_top"]]) {
+  for (const [id, key] of [["detail", "detail"], ["pool", "pool"], ["threshold", "threshold"], ["auto_top", "auto_top"],
+                            ["qualityRuns", "quality_runs"]]) {
     if (s[key] !== undefined) $(id).value = s[key];
   }
-  for (const [id, key] of [["fast", "fast"], ["half", "half"], ["useCache", "use_cache"], ["cheat", "cheat"]]) {
+  for (const [id, key] of [["fast", "fast"], ["half", "half"], ["useCache", "use_cache"],
+                            ["cheat", "cheat"], ["clipDiagnostic", "clip_diagnostic"],
+                            ["qualityCheck", "quality_check"]]) {
     if (s[key] !== undefined) $(id).checked = !!s[key];
   }
   const groups = new Set(s.groups || ["general"]);
@@ -737,48 +843,160 @@ function setOff(box, off) {
 }
 function updateStates() {
   const free = radio("mode") === "free";
+  const vlm = radio("naming") === "vlm";
   const usesGroups = !free || radio("naming") === "clip";
   setOff($("freeBox"), !free);
+  setOff($("vlmSizeBox"), !free || !vlm);
+  setOff($("clipDiagnosticBox"), !free || !vlm);
+  setOff($("qualityBox"), !free);
+  setOff($("qualityRunsBox"), !free || !$("qualityCheck").checked);
   setOff($("speedBox"), free);
   setOff($("groupBox"), !usesGroups);
+  $("start").textContent = free && $("qualityCheck").checked ? "Run SAM3 quality check" : "Start game";
   if (usesGroups) {
     $("auto_top").disabled = radio("group_mode") !== "auto";
     document.querySelectorAll("#groupBoxes input").forEach(i => { i.disabled = radio("group_mode") !== "custom"; });
   }
 }
 
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.ceil(seconds));
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60), remaining = total % 60;
+  if (minutes < 60) return `${minutes}m ${remaining}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+function estimateStepEta(s, stage, current, total) {
+  if (progressJobId !== s.job_id) {
+    progressJobId = s.job_id;
+    progressRates = {};
+  }
+  const key = `${stage}:${total}`;
+  const now = performance.now();
+  const previous = progressRates[key];
+  if (!previous || current < previous.current) {
+    progressRates[key] = { current, observedAt: now, secondsPerItem: null };
+    return null;
+  }
+  if (current > previous.current) {
+    const sample = (now - previous.observedAt) / 1000 / (current - previous.current);
+    previous.secondsPerItem = previous.secondsPerItem === null
+      ? sample
+      : previous.secondsPerItem * 0.7 + sample * 0.3;
+    previous.current = current;
+    previous.observedAt = now;
+  }
+  return previous.secondsPerItem === null
+    ? null
+    : previous.secondsPerItem * Math.max(0, total - current);
+}
+
 function updateJobProgress(s) {
   const text = $("jobProgressText");
   const bar = $("jobProgressBar");
   const log = s.log || "";
-  const searched = log.match(/searched (\d+)\/(\d+) concepts/);
-  const named = [...log.matchAll(/^\s*(\d+)\/(\d+):/gm)].pop();
-  const naming = log.match(/Naming (\d+) segments\.\.\./);
+  const elapsed = formatDuration(s.elapsed_seconds || 0);
+  const qualityStarted = /Starting SAM3 quality check:/.test(log);
+  const qualityStep = [...log.matchAll(/Quality run (\d+)\/(\d+): word (\d+)\/(\d+) complete - (.+)/g)].pop();
+  const searched = [...log.matchAll(/searched (\d+)\/(\d+) concepts/g)].pop();
+  const namingMarker = [...log.matchAll(/Naming (\d+) segments\.\.\./g)].pop();
+  const namingLog = namingMarker
+    ? log.slice(namingMarker.index + namingMarker[0].length)
+    : "";
+  const named = [...namingLog.matchAll(/^\s*(\d+)\/(\d+):/gm)].pop();
 
+  if (qualityStep) {
+    const run = Number(qualityStep[1]), runs = Number(qualityStep[2]);
+    const word = Number(qualityStep[3]), words = Number(qualityStep[4]);
+    const current = (run - 1) * words + word, total = runs * words;
+    const eta = estimateStepEta(s, "quality", current, total);
+    const etaText = eta === null ? "estimating ETA..." : `step ETA ~${formatDuration(eta)}`;
+    text.textContent = `SAM3 quality check: ${current} of ${total} prompts (run ${run}/${runs}, ${qualityStep[5]}) | elapsed ${elapsed} | ${etaText}`;
+    bar.value = total ? Math.round(current / total * 100) : 0;
+    return;
+  }
+  if (qualityStarted) {
+    bar.removeAttribute("value");
+    text.textContent = `Starting SAM3 quality check | elapsed ${elapsed} | estimating ETA...`;
+    return;
+  }
   if (searched) {
     const current = Number(searched[1]), total = Number(searched[2]);
-    text.textContent = `Searching for objects: ${current} of ${total} concepts`;
+    const eta = estimateStepEta(s, "search", current, total);
+    const etaText = eta === null ? "estimating ETA..." : `step ETA ~${formatDuration(eta)}`;
+    text.textContent = `Searching for objects: ${current} of ${total} concepts | elapsed ${elapsed} | ${etaText}`;
     bar.value = total ? Math.round(current / total * 100) : 0;
     return;
   }
   if (named) {
     const current = Number(named[1]), total = Number(named[2]);
-    text.textContent = `Naming objects: ${current} of ${total}`;
+    const eta = estimateStepEta(s, "naming", current, total);
+    const etaText = eta === null ? "estimating ETA..." : `step ETA ~${formatDuration(eta)}`;
+    text.textContent = `Naming objects: ${current} of ${total} | elapsed ${elapsed} | ${etaText}`;
     bar.value = total ? Math.round(current / total * 100) : 0;
     return;
   }
 
   bar.removeAttribute("value");
-  if (naming) text.textContent = `Naming objects from ${naming[1]} image segments...`;
-  else if (/Segmenting with /.test(log)) text.textContent = "Finding objects in the photo...";
-  else if (/Recognising the scene/.test(log)) text.textContent = "Recognising the scene...";
-  else if (/Loading (?:the naming model|CLIP|facebook\/)/i.test(log)) text.textContent = "Loading an AI model...";
-  else if (/Image encoded once|Searching for \d+ concepts/.test(log)) text.textContent = "Searching the photo for objects...";
-  else if (/Choosing and naming/.test(log)) text.textContent = "Choosing objects for the game...";
-  else if (/Loaded \d+ segments from cache/.test(log)) text.textContent = "Preparing saved image segments...";
-  else if (/kept \d+ segments/.test(log)) text.textContent = "Preparing image segments...";
-  else if (s.kind === "newgame") text.textContent = "Choosing objects for the next game...";
-  else text.textContent = "Preparing the game...";
+  if (namingMarker) {
+    text.textContent = `Naming objects from ${namingMarker[1]} image segments | elapsed ${elapsed} | estimating ETA...`;
+  } else if (/Segmenting with /.test(log)) {
+    text.textContent = `Finding objects in the photo | elapsed ${elapsed} | ETA unavailable during segmentation`;
+  } else if (/Recognising the scene/.test(log)) {
+    text.textContent = `Recognising the scene | elapsed ${elapsed}`;
+  } else if (/Loading (?:the naming model|CLIP|facebook\/)/i.test(log)) {
+    text.textContent = `Loading an AI model | elapsed ${elapsed}`;
+  } else if (/Image encoded once|Searching for \d+ concepts/.test(log)) {
+    text.textContent = `Searching the photo for objects | elapsed ${elapsed}`;
+  } else if (/Choosing and naming/.test(log)) {
+    text.textContent = `Choosing objects for the game | elapsed ${elapsed}`;
+  } else if (/Loaded \d+ segments from cache/.test(log)) {
+    text.textContent = `Preparing saved image segments | elapsed ${elapsed}`;
+  } else if (/kept \d+ segments/.test(log)) {
+    text.textContent = `Preparing image segments | elapsed ${elapsed}`;
+  } else if (s.kind === "newgame") {
+    text.textContent = `Choosing objects for the next game | elapsed ${elapsed}`;
+  } else {
+    text.textContent = `Preparing the game | elapsed ${elapsed}`;
+  }
+}
+
+function renderQualityReport(report, reportPath) {
+  const rows = $("qualityRows");
+  rows.textContent = "";
+  for (const item of report.items) {
+    const row = document.createElement("tr");
+    const values = [
+      item.segment,
+      item.word,
+      (item.mean_iou * 100).toFixed(1) + "%",
+      (item.mean_sam3_confidence * 100).toFixed(1) + "%",
+      item.mean_score.toFixed(1)
+    ];
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = String(value);
+      row.appendChild(cell);
+    }
+    const detailsCell = document.createElement("td");
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = "Details";
+    details.appendChild(summary);
+    for (const run of item.runs) {
+      const line = document.createElement("div");
+      line.textContent = `Run ${run.run}: "${run.prompt}" | IoU ${(run.iou * 100).toFixed(1)}% | confidence ${(run.sam3_confidence * 100).toFixed(1)}% | score ${run.score.toFixed(1)}`;
+      details.appendChild(line);
+    }
+    detailsCell.appendChild(details);
+    row.appendChild(detailsCell);
+    rows.appendChild(row);
+  }
+  $("qualitySummary").textContent =
+    `Evaluated ${report.items.length} named segments over ${report.runs} prompt runs. ` +
+    `${report.score_definition} Saved to ${reportPath}.`;
+  $("qualityDownload").href = "/api/quality_report";
 }
 
 /* ---------- start-up ---------- */
@@ -841,14 +1059,22 @@ async function poll() {
   try { s = await api("/api/status"); } catch (e) { setTimeout(poll, 1500); return; }
   if (s.error_id > shownError) { shownError = s.error_id; toast(s.error); menuError(s.error); }
   if (s.phase === "working") {
-    $("workTitle").textContent = s.kind === "newgame" ? "Choosing and naming objects\u2026" : "Finding the objects\u2026";
+    $("workTitle").textContent = s.kind === "newgame" ? "Choosing and naming objects\u2026"
+      : s.kind === "quality" ? "Checking names with SAM3\u2026"
+      : "Finding the objects\u2026";
+    $("workNote").textContent = s.kind === "quality"
+      ? "The interactive game is skipped; a JSON report will be saved."
+      : "The game opens automatically when it is ready.";
     updateJobProgress(s);
     view("working");
     setTimeout(poll, 600);
     return;
   }
   polling = false;
-  if (s.phase === "ready") {
+  if (s.phase === "report") {
+    renderQualityReport(s.quality_report, s.quality_report_path);
+    view("qualityReport");
+  } else if (s.phase === "ready") {
     if (s.game_id !== gameId) await loadGame();
     view("game");
   } else {
@@ -951,6 +1177,8 @@ async function newGame() {
 /* ---------- wiring ---------- */
 document.querySelectorAll('input[name="mode"],input[name="naming"],input[name="group_mode"]')
   .forEach(el => el.addEventListener("change", updateStates));
+$("qualityCheck").addEventListener("change", updateStates);
+$("qualityBack").addEventListener("click", () => view("menu"));
 $("photoFile").addEventListener("change", () => {
   const f = $("photoFile").files[0], p = $("photoPreview");
   if (f) { p.src = URL.createObjectURL(f); p.hidden = false; } else { p.hidden = true; }

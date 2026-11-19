@@ -5,7 +5,7 @@ Load a photo and the program turns it into a hidden-object game: a list of objec
 There are two kinds of game:
 
 - **Word list:** SAM 3 searches the photo for objects from a list of words (kitchen, bathroom, toys, and so on).
-- **Open-ended:** SAM segments the photo first, random segments are picked, and a small vision-language model (or CLIP) names them. There is no fixed word list.
+- **Open-ended:** SAM segments the photo first, random segments are picked, and a vision-language model (or CLIP) names them. VLM mode defaults to SmolVLM-500M, with the smaller SmolVLM-256M available in the settings. It preserves the full photo's aspect ratio and verifies proposed names against the highlighted scene and segment crop. An optional CLIP diagnostic reports competing labels without rejecting the VLM's result.
 
 ## What you need
 
@@ -96,7 +96,9 @@ Only do this on a network you trust (not public Wi-Fi): anyone on the network ca
 
 ### How to play
 
-Choose a photo, pick a kind of game, and press **Start game**. The first run on a new photo takes a while; the page shows the current step and a progress bar instead of raw console output. The bar shows a percentage when the app has a measurable item count, and animates while a model is loading or work cannot be measured. Click objects in the photo to find them: their names are struck off the list and they are darkened. Press **N** for a new game with a fresh random set of objects from the same photo.
+Choose a photo, pick a kind of game, and press **Start game**. The page shows the current step, elapsed time, and an approximate ETA once progress can be measured. SAM's automatic mask-generation step has no intermediate progress callback, so its bar remains indeterminate until segmentation finishes. Click objects in the photo to find them: their names are struck off the list and they are darkened. Press **N** for a new game with a fresh random set of objects from the same photo.
+
+In **Open-ended mode**, enable **Run SAM3 naming quality check instead of playing** to analyze the names and masks selected for the opening game. Choose 1–5 prompt runs; each uses a different text template for SAM3. The report lists each segment's mean mask IoU, SAM3 confidence, and a combined score (`100 × IoU × confidence`), plus the individual run results. This combined score is a comparison heuristic, not a calibrated probability. The check always uses SAM3 and requires access to its Hugging Face model, even if a different segmentation model was selected for generating the original masks. It can take a long time, especially on a CPU. Reports are saved as JSON under `.cache/sam3_hidden_objects/quality_reports` in your user folder and can also be downloaded from the report page.
 
 Results are saved per photo, so a photo you have played before starts almost immediately. They are stored in `.cache/sam3_hidden_objects` in your user folder; delete that folder to clear them.
 
@@ -106,6 +108,13 @@ Results are saved per photo, so a photo you have played before starts almost imm
 - Use a smaller segmentation model: "SAM 2.1 small" or "tiny".
 - On the word-list game, let the scene recognition pick the word groups instead of searching every group.
 - Use "CLIP with the word groups" instead of the vision-language model for naming.
+- The VLM's CLIP diagnostic loads CLIP on the CPU and can be slow; it is intended to help inspect competing labels, not to decide correctness.
+
+To run the open-ended script with the diagnostic enabled:
+
+```
+python segment_then_name.py photo.jpg --clip-diagnostic
+```
 
 ## Troubleshooting
 
