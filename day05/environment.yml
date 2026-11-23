@@ -6,7 +6,7 @@
 #
 # NVIDIA GPU? Install the CUDA build of PyTorch from pytorch.org into the new environment,
 # then run:  pip install -r requirements.txt   (see the notes in requirements.txt)
-name: sam3-objects
+name: web-obj-game
 channels:
   - conda-forge
   - nodefaults
