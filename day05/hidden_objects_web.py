@@ -488,8 +488,11 @@ class Session:
             if self.modules is None:
                 return {"ready": False, "load_error": self.load_error}
             device = self.modules["list"].pick_device()
-            label = {"cuda": "an NVIDIA graphics card (fast)", "mps": "the Apple graphics chip"}.get(
-                device, "the CPU only (slow, so keep Fast mode on and expect some waiting)")
+            if device == "cuda" and getattr(self.modules["list"].torch.version, "hip", None):
+                label = "an AMD graphics card via ROCm (fast)"
+            else:
+                label = {"cuda": "an NVIDIA graphics card (fast)", "mps": "the Apple graphics chip"}.get(
+                    device, "the CPU only (slow, so keep Fast mode on and expect some waiting)")
             return {"ready": True, "device_label": f"Ready. The models will run on {label}.",
                     "groups": list(self.modules["list"].CONCEPT_GROUPS), "sam_choices": list(SAM_CHOICES)}
 

@@ -13,13 +13,13 @@ There are two kinds of game:
 - About **10 GB of free disk space** for the libraries and the downloaded models (a rough estimate; the first run downloads them)
 - An internet connection for the first run
 - A free **Hugging Face account** if you want SAM 3 (see below)
-- A computer with an **NVIDIA graphics card** is much faster, but not required. On a CPU everything works, but the first steps take minutes.
+- A computer with a supported **NVIDIA or AMD graphics card** can be much faster, but is not required. On a CPU everything works, but the first steps take minutes. The AMD RX 7600 Windows setup below is best-effort.
 
 ## 1. Get the files
 
 Put these files in one folder:
 
-`hidden_objects_web.py`, `hidden_objects_training.html`, `hidden_objects_app.py`, `segment_and_name_sam3.py`, `segment_then_name.py`, `clip_word_groups.json`, `requirements.txt`, `environment.yml`, `check_setup.py`, and (Windows) the launcher files.
+`hidden_objects_web.py`, `hidden_objects_training.html`, `hidden_objects_app.py`, `segment_and_name_sam3.py`, `segment_then_name.py`, `clip_word_groups.json`, `requirements.txt`, `environment.yml`, `environment-amd.yml`, the AMD requirements files, `check_setup.py`, and (Windows) the launcher files.
 
 ## 2. Install the dependencies
 
@@ -46,6 +46,28 @@ pip install -r requirements.txt
 ### NVIDIA graphics card
 
 Install PyTorch with CUDA support **before** the step above, using the command from the selector at https://pytorch.org/get-started/locally/ (choose Pip and your CUDA version). Then run `pip install -r requirements.txt`; pip will keep your GPU build. A plain `pip install torch` on Windows installs a CPU-only build.
+
+### AMD Radeon RX 7600 on Windows (best-effort)
+
+AMD's ROCm 7.2.1 Windows PyTorch wheels require Windows 11, Python 3.12, and AMD's 26.2.2 graphics driver. AMD lists the RX 7600 in the [Windows HIP SDK hardware table](https://rocm.docs.amd.com/projects/install-on-windows/en/latest/reference/system-requirements.html), but it is omitted from the [ROCm 7.2.1 PyTorch-on-Windows support matrix](https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibilityrad/windows/windows_compatibility.html) (the RX 7600 is gfx1102). This setup is therefore **best-effort and not officially supported for this GPU**; it may install without being able to run PyTorch on the card. The game uses inference only.
+
+Use the AMD-specific files, not `environment.yml` or `requirements.txt`:
+
+```
+conda env create -f environment-amd.yml
+conda activate web-obj-game-amd
+python -m pip install -r requirements-amd-rocm.txt
+python -m pip install -r requirements-amd-torch.txt
+python -m pip install -r requirements-amd.txt
+```
+
+The staged installs follow AMD's order: ROCm runtime first, then its pinned PyTorch/torchvision/torchaudio wheels, then the game dependencies. Do not install the standard `requirements.txt` afterward, because it may replace the AMD PyTorch build. Verify the device before starting the game:
+
+```
+python -c "import torch; print('HIP:', torch.version.hip); print('GPU available:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'No GPU detected')"
+```
+
+If the check reports no GPU, use CPU mode or a ROCm-supported GPU. The existing `play_hidden_objects_web.bat` targets the regular `web-obj-game` environment; with this AMD environment, launch from the activated prompt using `python hidden_objects_web.py` (or add `--training --port 5001` for the label trainer).
 
 ## 3. Get access to SAM 3 (free, but needs approval)
 
@@ -125,7 +147,7 @@ python segment_then_name.py photo.jpg --clip-diagnostic
 |---|---|
 | `check_setup.py` says a package is missing | Run `pip install -r requirements.txt` inside the right environment. |
 | "gated repo" or 401 or 403 error | You are not logged in, or not yet approved for SAM 3. Run `hf auth login`, check your request at https://huggingface.co/facebook/sam3, or use a SAM 2.1 model. |
-| Everything runs on the CPU although you have an NVIDIA card | You have a CPU-only PyTorch. Reinstall it from https://pytorch.org/get-started/locally/. |
+| Everything runs on the CPU although you have a supported graphics card | Check that the selected environment has the matching GPU-enabled PyTorch build and that its driver/GPU is supported. For AMD RX 7600 Windows setup, see the best-effort instructions above. |
 | `ImportError` for `Sam3Model` | Run `pip install -U "transformers>=5.0,<6"`. |
 | Windows warning about symlinks | Harmless; it is switched off in the program. |
 | The page does not open | Go to http://127.0.0.1:5000 yourself. If the port is busy, use `python hidden_objects_web.py --port 5050`. |
@@ -143,6 +165,7 @@ python segment_then_name.py photo.jpg --clip-diagnostic
 | `segment_then_name.py` | The open-ended game |
 | `clip_word_groups.json` | Built-in and training-added words, organized by CLIP group |
 | `requirements.txt`, `environment.yml` | Dependencies |
+| `requirements-amd*.txt`, `environment-amd.yml` | Best-effort Windows ROCm environment files for AMD Radeon GPUs |
 | `check_setup.py` | Checks your installation |
 | `play_hidden_objects_web.bat`, `play_hidden_objects_phone.bat`, `train_clip_labels_web.bat`, `play_hidden_objects.bat` | Windows launchers (normal web, web for phones on your Wi-Fi, CLIP label trainer, and desktop versions) |
 

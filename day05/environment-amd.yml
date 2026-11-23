@@ -1,0 +1,9 @@
+# Best-effort Windows environment for AMD ROCm PyTorch.
+# See README.md for the required staged wheel installation.
+name: web-obj-game-amd
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - pip

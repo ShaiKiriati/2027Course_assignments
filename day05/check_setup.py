@@ -49,7 +49,12 @@ def main():
         version, err = version_of(module, pip_name)
         line(version is not None, f"{pip_name}: {version if version else 'NOT INSTALLED (' + str(err)[:80] + ')'}")
         if version is None:
-            PROBLEMS.append(f"Missing package {pip_name}. Run:  pip install -r requirements.txt")
+            if pip_name in ("torch", "torchvision"):
+                PROBLEMS.append("Install the PyTorch build matching your GPU. For AMD ROCm, follow the "
+                                "AMD-specific instructions in README.md.")
+            else:
+                PROBLEMS.append(f"Missing package {pip_name}. Install requirements.txt, or requirements-amd.txt "
+                                "after the AMD ROCm wheels.")
 
     print("\nTransformers models")
     try:
@@ -66,12 +71,17 @@ def main():
     try:
         import torch
         if torch.cuda.is_available():
-            line(True, f"NVIDIA GPU found: {torch.cuda.get_device_name(0)} (the game will be fast)")
+            backend = getattr(torch.version, "hip", None)
+            vendor = "AMD GPU (ROCm)" if backend else "NVIDIA GPU"
+            line(True, f"{vendor} found: {torch.cuda.get_device_name(0)} (the game will be fast)")
         elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
             line(True, "Apple GPU (mps) found")
         else:
             line(True, "No supported GPU: the game will run on the CPU (works, but is slow)")
-            if getattr(torch.version, "cuda", None) is None:
+            if getattr(torch.version, "hip", None):
+                NOTES.append("ROCm PyTorch is installed but no supported AMD GPU was detected. Check the ROCm/driver "
+                             "compatibility for this GPU.")
+            elif getattr(torch.version, "cuda", None) is None:
                 NOTES.append("This PyTorch is a CPU-only build. If you do have an NVIDIA GPU, reinstall PyTorch from "
                              "https://pytorch.org/get-started/locally/ with your CUDA version.")
     except Exception:
@@ -87,7 +97,8 @@ def main():
 
     print("\nGame files in this folder")
     here = Path(__file__).resolve().parent
-    for name in ["segment_and_name_sam3.py", "segment_then_name.py", "hidden_objects_web.py", "hidden_objects_app.py"]:
+    for name in ["segment_and_name_sam3.py", "segment_then_name.py", "clip_word_groups.json",
+                 "hidden_objects_web.py", "hidden_objects_app.py"]:
         exists = (here / name).is_file()
         line(exists, name)
         if not exists and name != "hidden_objects_app.py":

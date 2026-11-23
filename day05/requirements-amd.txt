@@ -1,0 +1,8 @@
+# Install after requirements-amd-rocm.txt and requirements-amd-torch.txt.
+# torch and torchvision are intentionally excluded so pip does not replace the AMD builds.
+transformers>=5.0,<6
+accelerate
+pillow>=10
+numpy>=1.26
+matplotlib>=3.7
+flask>=3.0
