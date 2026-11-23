@@ -55,6 +55,10 @@ SAM_CHOICES = {
 DARKEN_RGBA = (0, 0, 0, 175)   # overlay on found objects
 CHEAT_COLORS = [(230, 25, 75), (60, 180, 75), (255, 225, 25), (0, 130, 200), (245, 130, 48), (145, 30, 180),
                 (70, 240, 240), (240, 50, 230), (210, 245, 60), (250, 190, 190), (0, 128, 128), (170, 110, 40)]
+TRAINING_COLORS = CHEAT_COLORS + [
+    (128, 0, 0), (0, 0, 128), (128, 128, 0), (0, 128, 128),
+    (128, 0, 128), (0, 90, 160), (120, 70, 20), (70, 110, 20),
+]
 
 
 # --------------------------------------------------------------------------
@@ -220,6 +224,9 @@ class Session:
         self.cheat = False
         self.chosen, self.labels, self.areas = [], [], []
         self.found = set()
+        self.training_mode = False
+        self.training_items = []
+        self.training_saved = set()
         self.game_id = 0
         self.png_cache = {}
 
@@ -288,6 +295,25 @@ class Session:
                 self.begin_game(first)
         self.start_job("find", job)
 
+    def find_training_items(self, module, path, args):
+        """Prepare CLIP labels and retain only rejected/uncertain items for review."""
+        def job():
+            image, instances, extras = module.prepare(path, args, self.stop_event)
+            items = extras.get("training_items", [])
+            with self.lock:
+                self.image, self.instances, self.extras = image, instances, extras
+                self.cheat = False
+                self.training_mode = True
+                self.training_items = list(items)
+                self.training_saved = set()
+                self.chosen = [inst for inst, _status, _groups in items]
+                self.labels = [inst.name for inst in self.chosen]
+                self.areas = [int(inst.mask.sum()) for inst in self.chosen]
+                self.found = set()
+                self.png_cache = {}
+                self.game_id += 1
+        self.start_job("training", job)
+
     def check_naming_quality(self, module, path, args):
         def job():
             image, _, extras = module.prepare(path, args, self.stop_event)
@@ -321,6 +347,9 @@ class Session:
 
     # ---- game state ------------------------------------------------------
     def begin_game(self, chosen):
+        self.training_mode = False
+        self.training_items = []
+        self.training_saved = set()
         self.chosen = list(chosen)
         self.labels = self.modules["list"].unique_labels(self.chosen) if self.chosen else []
         self.areas = [int(i.mask.sum()) for i in self.chosen]
@@ -390,6 +419,61 @@ class Session:
                 self.png_cache["cheat"] = png_bytes(rgba)
             return self.png_cache["cheat"]
 
+    def training_review(self):
+        with self.lock:
+            if not self.training_mode or self.image is None:
+                return None
+            return {
+                "game_id": self.game_id,
+                "width": self.image.width,
+                "height": self.image.height,
+                "items": [
+                    {
+                        "index": index,
+                        "label": instance.name,
+                        "status": status,
+                        "source_groups": list(source_groups),
+                        "color": "#{:02x}{:02x}{:02x}".format(*TRAINING_COLORS[index % len(TRAINING_COLORS)]),
+                        "saved": index in self.training_saved,
+                    }
+                    for index, (instance, status, source_groups) in enumerate(self.training_items)
+                ],
+            }
+
+    def training_outline_png(self, game_id):
+        with self.lock:
+            if not self.training_mode or game_id != self.game_id or self.image is None:
+                return None
+            key = "training-outline"
+            if key not in self.png_cache:
+                h, w = self.image.height, self.image.width
+                rgba = np.zeros((h, w, 4), dtype=np.uint8)
+                for index, (instance, _status, _source_groups) in enumerate(self.training_items):
+                    mask = instance.mask
+                    padded = np.pad(mask, 1, constant_values=False)
+                    interior = (mask & padded[:-2, 1:-1] & padded[2:, 1:-1]
+                                & padded[1:-1, :-2] & padded[1:-1, 2:])
+                    outline = mask & ~interior
+                    rgba[outline] = (*TRAINING_COLORS[index % len(TRAINING_COLORS)], 255)
+                self.png_cache[key] = png_bytes(rgba)
+            return self.png_cache[key]
+
+    def save_training_word(self, game_id, index, word, group):
+        with self.lock:
+            if not self.training_mode or game_id != self.game_id:
+                raise Stale("This training review has changed. Reload the page.")
+            if not 0 <= index < len(self.training_items):
+                raise Stale("This training label no longer exists.")
+            if self.modules is None:
+                raise Stale("The CLIP model module is not loaded.")
+            instance, _status, source_groups = self.training_items[index]
+            if not isinstance(group, str) or group not in source_groups:
+                raise ValueError("Choose one of the source groups for this label.")
+            normalized, added = self.modules["list"].save_concept_word(group, word)
+            instance.name = normalized
+            self.training_saved.add(index)
+            return {"word": normalized, "group": group, "added": added, "index": index}
+
     def photo_jpeg(self):
         with self.lock:
             if self.image is None:
@@ -431,6 +515,7 @@ upload_counter = 0
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 60 * 1024 * 1024
+app.config["TRAINING_MODE"] = False
 
 
 @app.after_request
@@ -442,6 +527,11 @@ def no_store(resp):
 
 @app.get("/")
 def index():
+    if app.config.get("TRAINING_MODE"):
+        response = send_file(Path(__file__).with_name("hidden_objects_training.html"),
+                             mimetype="text/html", max_age=0)
+        response.headers["Cache-Control"] = "no-store"
+        return response
     return Response(INDEX_HTML, mimetype="text/html", headers={"Cache-Control": "no-store"})
 
 
@@ -453,6 +543,7 @@ def favicon():
 @app.get("/api/info")
 def api_info():
     info = SESSION.info()
+    info["training_mode"] = bool(app.config.get("TRAINING_MODE"))
     phone_url = app.config.get("PHONE_URL")
     if phone_url:
         info["phone_url"] = phone_url
@@ -485,6 +576,10 @@ def api_start():
         return jsonify(error="Please choose a PNG or JPEG photo."), 400
     try:
         settings = json.loads(request.form.get("settings", "{}"))
+        if not isinstance(settings, dict):
+            return jsonify(error="Settings must be a JSON object."), 400
+        if app.config.get("TRAINING_MODE"):
+            settings.update(mode="free", naming="clip", quality_check=False)
         if SESSION.modules is None:
             return jsonify(error="The libraries are still loading. Please wait a moment."), 409
         module, args = build_args(SESSION.modules, settings)
@@ -497,13 +592,52 @@ def api_start():
     photo.save(path)
     args.quality_image_name = secure_filename(photo.filename)
     try:
-        if args.quality_check:
+        if app.config.get("TRAINING_MODE"):
+            args.training_mode = True
+            SESSION.find_training_items(module, str(path), args)
+        elif args.quality_check:
             SESSION.check_naming_quality(module, str(path), args)
         else:
             SESSION.find_objects(module, str(path), args)
     except Busy as e:
         return jsonify(error=str(e)), 409
     return jsonify(ok=True)
+
+
+@app.get("/api/training")
+def api_training():
+    review = SESSION.training_review()
+    if review is None:
+        return jsonify(error="There is no training review yet."), 404
+    return jsonify(review)
+
+
+@app.get("/api/training/outline/<int:game_id>.png")
+def api_training_outline(game_id):
+    data = SESSION.training_outline_png(game_id)
+    return Response(data, mimetype="image/png") if data else ("", 404)
+
+
+@app.post("/api/training/learn")
+def api_training_learn():
+    if request.remote_addr not in ("127.0.0.1", "::1"):
+        return jsonify(error="Only the computer running the trainer can update its vocabulary."), 403
+    body = request.get_json(silent=True) or {}
+    try:
+        game_id, index, word, group = (
+            int(body["game_id"]), int(body["index"]), body["word"], body["group"]
+        )
+    except (KeyError, TypeError, ValueError):
+        return jsonify(error="Provide a training game, label index, corrected word, and group."), 400
+    try:
+        result = SESSION.save_training_word(game_id, index, word, group)
+    except Stale as e:
+        return jsonify(error=str(e)), 409
+    except ValueError as e:
+        return jsonify(error=str(e)), 400
+    except (OSError, RuntimeError) as e:
+        return jsonify(error=f"Could not update the CLIP word groups: {e}"), 500
+    return jsonify(result)
 
 
 @app.post("/api/new_game")
@@ -1238,7 +1372,10 @@ def main():
                         help="address to listen on. The default (127.0.0.1) allows only this computer; "
                              "use 0.0.0.0 to let phones and tablets on your Wi-Fi connect too")
     parser.add_argument("--no-browser", action="store_true", help="don't open the browser automatically")
+    parser.add_argument("--training", action="store_true",
+                        help="open the CLIP label-training interface instead of the game")
     cli = parser.parse_args()
+    app.config["TRAINING_MODE"] = cli.training
 
     ip = None
     if cli.host not in ("127.0.0.1", "localhost", "::1"):
@@ -1251,7 +1388,8 @@ def main():
     if not cli.no_browser:
         threading.Timer(1.2, webbrowser.open, args=(url,)).start()
     logging.getLogger("werkzeug").setLevel(logging.WARNING)   # no log line for every progress poll
-    print(f"Hidden Object Game is running at {url}")
+    title = "CLIP Label Training" if cli.training else "Hidden Object Game"
+    print(f"{title} is running at {url}")
     if cli.host not in ("127.0.0.1", "localhost", "::1"):
         print()
         print("Phones and tablets on the same Wi-Fi can play too. Open this address on the phone:")

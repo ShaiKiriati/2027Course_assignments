@@ -11,6 +11,7 @@ Play: left-click an object in the picture. Its name is struck off the list and
 the object is covered by a dark overlay. Found objects stay struck off and
 darkened until you have found them all.
 Press N for a new game (a fresh random set from the same image; no re-run of SAM 3).
+Concept group words are stored in clip_word_groups.json next to this file.
 
 Setup:
     pip install -U transformers torch pillow numpy matplotlib accelerate
@@ -40,6 +41,7 @@ import argparse
 import hashlib
 import json
 import random
+import threading
 import time
 import math
 from collections import Counter
@@ -62,138 +64,25 @@ MAX_SIDE = 1280        # downscale very large images for speed/memory
 MIN_AREA = 0.001       # ignore instances smaller than this fraction of the image
 DEDUPE_IOU = 0.7       # drop overlapping instances found under different concepts
 
-# Candidate concepts. SAM 3 only looks for what you ask for, so edit freely
-# or pass --concepts with one phrase per line. More concepts = slower.
-DEFAULT_CONCEPTS = """
-person, man, woman, child, dog, cat, horse, cow, sheep, bird, fish, elephant,
-giraffe, zebra, bear, car, truck, bus, motorcycle, bicycle, boat, airplane,
-train, traffic light, stop sign, bench, chair, sofa, table, desk, bed, pillow,
-lamp, bookshelf, cabinet, door, window, curtain, mirror, rug, clock, vase,
-potted plant, flower, tree, bush, laptop, monitor, keyboard, computer mouse,
-phone, television, remote control, speaker, headphones, camera, cup, mug,
-glass, bottle, bowl, plate, fork, knife, spoon, pot, pan, kettle, toaster,
-microwave, oven, refrigerator, sink, toilet, towel, book, paper, pen, scissors,
-backpack, handbag, suitcase, umbrella, hat, helmet, shirt, jacket, dress, pants,
-shoe, glasses, watch, ball, kite, skateboard, surfboard, guitar, teddy bear,
-apple, banana, orange, tomato, carrot, broccoli, bread, cake, pizza, sandwich,
-fence, building, house, bridge, road, sign, flag, balloon, painting, basket,
-box, bucket, candle, mountain, rock, cloud
-"""
+CONCEPT_GROUPS_PATH = Path(__file__).with_name("clip_word_groups.json")
+_CONCEPT_GROUPS_LOCK = threading.Lock()
 
-CLOSET = """
-hanger, coat hanger, sweater, hoodie, t-shirt, jeans, skirt, blazer, suit jacket,
-coat, raincoat, bathrobe, scarf, belt, tie, gloves, socks, cap, boots, sandals,
-sneakers, high heels, slippers, shoe box, purse, duffel bag, folded clothes,
-laundry basket, iron, ironing board, vacuum cleaner, storage bin
-"""
 
-DRESSER = """
-folded shirt, folded pants, underwear, bra, pajamas, jewelry box, necklace,
-bracelet, ring, earrings, perfume bottle, lipstick, makeup brush, hairbrush,
-comb, hair dryer, tissue box, alarm clock, picture frame, trinket tray, drawer,
-drawer handle, wallet, sunglasses, lotion bottle, jewelry
-"""
+def load_concept_groups():
+    try:
+        groups = json.loads(CONCEPT_GROUPS_PATH.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as e:
+        raise RuntimeError(f"Could not read CLIP word groups at {CONCEPT_GROUPS_PATH}: {e}") from e
+    if not isinstance(groups, dict) or not groups:
+        raise RuntimeError(f"Invalid CLIP word groups file: {CONCEPT_GROUPS_PATH}")
+    for group, words in groups.items():
+        if (not isinstance(group, str) or not group.strip() or not isinstance(words, list)
+                or any(not isinstance(word, str) or not word.strip() for word in words)):
+            raise RuntimeError(f"Invalid CLIP word groups file: {CONCEPT_GROUPS_PATH}")
+    return groups
 
-REFRIGERATOR = """
-milk carton, egg carton, eggs, butter, cheese, yogurt, jar, ketchup bottle,
-mustard bottle, jam jar, juice bottle, soda can, beer bottle, water bottle,
-food container, leftovers container, plastic wrap, lettuce, cucumber,
-bell pepper, lemon, grapes, strawberries, blueberries, avocado, onion, garlic,
-mushroom, ham, sausage, bacon, raw chicken, meat, tofu, tortillas, salad,
-pickle jar, sauce bottle, mayonnaise jar, ice tray, freezer drawer, pie
-"""
 
-DISHWASHER = """
-dishwasher rack, utensil basket, wine glass, drinking glass, coffee cup,
-tea cup, saucer, dinner plate, serving bowl, mixing bowl, baking tray,
-cutting board, spatula, ladle, whisk, tongs, colander, grater, peeler,
-can opener, measuring cup, pot lid, food storage container, baby bottle,
-chopsticks, sponge, dish soap, casserole dish, frying pan, teaspoon,
-butter knife, steak knife, teapot, pitcher
-"""
-
-PANTRY = """
-canned food, tin can, soup can, cereal box, pasta, spaghetti, bag of rice,
-bag of flour, sugar, salt shaker, pepper shaker, spice jar, olive oil bottle,
-vinegar bottle, honey jar, peanut butter jar, coffee beans, tea box, cookies,
-crackers, bag of chips, granola bar, oatmeal, noodles, cooking oil, lentils,
-nuts, dried fruit, popcorn, baking soda, broth carton, pasta sauce jar,
-juice box, glass jar, storage jar, paper bag, plastic bag, shopping bag
-"""
-
-SUITCASE = """
-suitcase, passport, travel pillow, toiletry bag, toothbrush, toothpaste,
-shampoo bottle, razor, phone charger, charging cable, power adapter,
-packing cube, luggage tag, swimsuit, flip flops, sunscreen, guidebook, map,
-eye mask, hair straightener, deodorant, boarding pass, ticket, keys,
-tablet, e-reader, power bank, zipper
-"""
-
-DESK = """
-stapler, tape dispenser, paper clip, binder clip, sticky notes, notepad, notebook,
-pencil, pencil case, pencil sharpener, eraser, ruler, highlighter, marker,
-calculator, desk lamp, mouse pad, webcam, laptop stand, monitor stand, USB flash drive,
-external hard drive, docking station, power strip, cable, desk organizer,
-pen holder, calendar, planner, folder, binder, envelope, paper tray, letter opener,
-hole punch, glue stick, correction tape, rubber band, push pin, clipboard,
-paperweight, business card, whiteboard, desk fan, headset, stylus
-"""
-
-TOYS = """
-toy car, toy truck, toy train, toy robot, toy airplane, toy boat, toy dinosaur,
-toy horse, rocking horse, action figure, doll, dollhouse, stuffed animal,
-puppet, building blocks, wooden blocks, jigsaw puzzle, rubber duck, rattle,
-pacifier, xylophone, toy piano, toy drum, yo-yo, spinning top, marbles,
-jump rope, bouncy ball, beach ball, play dough, crayons, coloring book,
-chalk, bubble wand, slinky, tricycle, toy kitchen, toy phone, water gun,
-toy figurine, ride-on toy, sandbox toy
-"""
-
-GAMES = """
-playing cards, deck of cards, dice, chess board, chess piece, checkers board,
-checker piece, board game, game box, game board, dominoes, poker chips,
-letter tile, puzzle box, puzzle cube, video game controller, game console,
-joystick, game cartridge, handheld game console, VR headset, arcade machine,
-pinball machine, dartboard, dart, billiard ball, pool cue, ping pong paddle,
-table tennis ball, foosball table, mahjong tile, tarot cards, game timer,
-hourglass, trophy, medal, game spinner, game pawn, score pad, bingo card
-"""
-
-BATHROOM = """
-toilet paper, toilet paper roll, toothbrush, electric toothbrush, toothpaste,
-toothbrush holder, mouthwash, dental floss, soap dispenser, bar of soap,
-shampoo bottle, conditioner bottle, body wash, razor, shaving cream,
-hand towel, bath towel, washcloth, bath mat, shower curtain, showerhead,
-bathtub, faucet, bathroom scale, comb, cotton swabs, cotton balls, tissue box,
-trash can, plunger, toilet brush, loofah, sponge, nail clippers, tweezers,
-medicine cabinet, first aid kit, pill bottle, adhesive bandage, towel rack,
-laundry hamper, nail polish, makeup bag, curling iron, hand sanitizer,
-bubble bath, air freshener
-"""
-
-BEDROOM = """
-mattress, pillowcase, duvet, comforter, bed sheet, quilt, bedspread, headboard,
-bed frame, bunk bed, crib, nightstand, bedside lamp, dresser, wardrobe,
-closet door, curtains, window blinds, ceiling fan, floor lamp, throw pillow,
-bean bag, nightlight, humidifier, wall art, poster, picture frame, bookshelf,
-reading glasses, eye mask, phone charger, alarm clock, laundry basket,
-slippers, pajamas, stuffed animal, armchair, jewelry box, rug
-"""
-
-CONCEPT_GROUPS = {
-    "general": DEFAULT_CONCEPTS,
-    "closet": CLOSET,
-    "dresser": DRESSER,
-    "refrigerator": REFRIGERATOR,
-    "dishwasher": DISHWASHER,
-    "pantry": PANTRY,
-    "suitcase": SUITCASE,
-    "desk": DESK,
-    "toys": TOYS,
-    "games": GAMES,
-    "bathroom": BATHROOM,
-    "bedroom": BEDROOM,
-}
+CONCEPT_GROUPS = load_concept_groups()
 
 # Used by --groups auto: CLIP compares the whole image against these descriptions
 # to decide which concept groups are worth searching. "general" is always included.
@@ -260,19 +149,55 @@ def load_concepts(path, groups="all"):
         with open(path, encoding="utf-8") as f:
             items = [line.strip() for line in f if line.strip()]
     else:
-        names = list(CONCEPT_GROUPS) if groups == "all" else [g.strip() for g in groups.split(",")]
-        unknown = [g for g in names if g not in CONCEPT_GROUPS]
-        if unknown:
-            raise SystemExit(f"Unknown group(s): {unknown}. Choose from: {list(CONCEPT_GROUPS)}")
-        items = []
-        for g in names:
-            items += [c.strip() for c in CONCEPT_GROUPS[g].replace("\n", " ").split(",")]
+        items, _sources = load_concepts_with_groups(groups)
+        return items
     seen, out = set(), []
     for c in items:
         if c and c not in seen:
             seen.add(c)
             out.append(c)
     return out
+
+
+def load_concepts_with_groups(groups="all"):
+    concept_groups = load_concept_groups()
+    names = list(concept_groups) if groups == "all" else [g.strip() for g in groups.split(",")]
+    unknown = [g for g in names if g not in concept_groups]
+    if unknown:
+        raise SystemExit(f"Unknown group(s): {unknown}. Choose from: {list(concept_groups)}")
+    items, sources, indices = [], [], {}
+    for group in names:
+        for concept in concept_groups[group]:
+            key = concept.casefold()
+            if key not in indices:
+                indices[key] = len(items)
+                items.append(concept)
+                sources.append([group])
+            elif group not in sources[indices[key]]:
+                sources[indices[key]].append(group)
+    return items, sources
+
+
+def save_concept_word(group, word):
+    if not isinstance(group, str):
+        raise ValueError("Choose a valid word group.")
+    if not isinstance(word, str):
+        raise ValueError("Enter a word or short phrase.")
+    normalized = " ".join(word.split())
+    if (not normalized or len(normalized) > 80 or len(normalized.split()) > 5
+            or any(ord(char) < 32 or ord(char) == 127 for char in normalized)):
+        raise ValueError("Use a non-empty label of up to five words and 80 characters.")
+    with _CONCEPT_GROUPS_LOCK:
+        groups = load_concept_groups()
+        if group not in groups:
+            raise ValueError(f"Unknown word group: {group}")
+        if any(existing.casefold() == normalized.casefold() for existing in groups[group]):
+            return normalized, False
+        groups[group].append(normalized)
+        temp_path = CONCEPT_GROUPS_PATH.with_suffix(CONCEPT_GROUPS_PATH.suffix + ".tmp")
+        temp_path.write_text(json.dumps(groups, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        temp_path.replace(CONCEPT_GROUPS_PATH)
+    return normalized, True
 
 
 @torch.no_grad()

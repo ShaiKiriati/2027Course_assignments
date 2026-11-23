@@ -8,7 +8,8 @@ Hidden Object Game, open-ended version: segment first, name afterwards.
    - "vlm" (default): a vision-language model sees the full photo with the
      segment highlighted, plus a close-up, names it. CLIP quickly checks the
      proposed name; the VLM verifies only uncertain cases.
-   - "clip": CLIP picks the best match from the word groups (much faster).
+   - "clip": CLIP picks a word-group label, checks it against the highlighted
+     scene, and searches all groups for an alternative if the check disagrees.
 3. The names become the list in the game window. Click objects to find them.
    Press N for a new game: new random segments are picked and named.
 
@@ -39,7 +40,8 @@ from transformers import (AutoModelForImageTextToText, AutoProcessor, CLIPModel,
 
 import segment_and_name_sam3 as base
 from segment_and_name_sam3 import (CONCEPT_GROUPS, Cancelled, Instance, choose_file,  # noqa: F401
-                                   detect_groups, load_concepts, pick_device, show)
+                                   detect_groups, load_concepts, load_concepts_with_groups,
+                                   pick_device, show)
 
 SAM_MODEL = "facebook/sam3"                       # segmentation; also works: facebook/sam2.1-hiera-small
 VLM_MODELS = {
@@ -54,6 +56,8 @@ MAX_SEGMENTS = 80       # keep the best-scoring segments only
 MIN_AREA, MAX_AREA = 0.004, 0.60   # allowed segment size (fraction of the image)
 NMS_IOU = 0.6           # drop near-duplicate segments
 CLIP_MIN_CONF = 0.15    # --namer clip: reject names CLIP is unsure about
+CLIP_CONTEXT_WEIGHT = 0.25
+CLIP_VERIFICATION_VERSION = 1
 CLIP_VERIFY_ACCEPT = 0.70
 CLIP_VERIFY_REJECT = 0.25
 CLIP_VERIFY_PROMPTS = (
@@ -147,7 +151,7 @@ def crop_segment(image_arr, mask):
 
 
 def highlight_segment(image_arr, mask):
-    """Tint a segment in the full photo so the VLM can use its scene context."""
+    """Tint a segment in the full photo so a namer can use its scene context."""
     highlighted = image_arr.copy()
     tint = np.array([255, 128, 0], dtype=np.float32)
     highlighted[mask] = (highlighted[mask].astype(np.float32) * 0.4 + tint * 0.6).astype(np.uint8)
@@ -239,7 +243,9 @@ class VlmNamer:
                     print(f"  CLIP diagnostic: {name!r} ranked {rank}/{total}; alternatives: {top}")
                 verdict = "unclear"
                 if self.clip_verifier is not None:
-                    verdict, confidence = self.clip_verifier.assess_name(crop, name)
+                    verdict, confidence = self.clip_verifier.assess_name(
+                        crop, name, context_image
+                    )
                     print(f"  CLIP check: {name!r} {verdict} ({confidence:.2f})")
                 if verdict == "unclear":
                     supported, answer = self.verify_name(context_image, crop, name)
@@ -254,23 +260,34 @@ class VlmNamer:
 
 
 class ClipNamer:
-    """Fast naming: CLIP picks the best match from a vocabulary (the word groups)."""
+    """CLIP names segments, verifies with scene context, and recovers across all groups."""
 
-    def __init__(self, clip_name, vocab, device, min_conf):
+    def __init__(self, clip_name, vocab, device, min_conf, fallback_vocab=None,
+                 training_mode=False, vocab_groups=None):
         if vocab:
             print(f"Loading CLIP ({clip_name}) with {len(vocab)} names on {device}...")
         else:
             print(f"Loading CLIP verifier ({clip_name}) on {device}...")
         self.device, self.vocab, self.min_conf = device, vocab, min_conf
+        self.fallback_vocab = vocab if fallback_vocab is None else fallback_vocab
+        self.training_mode = training_mode
+        self.vocab_groups = vocab_groups or [[] for _ in vocab]
+        self.last_verdicts = []
+        self.last_sources = []
         self.model = CLIPModel.from_pretrained(clip_name).to(device).eval()
         self.processor = CLIPProcessor.from_pretrained(clip_name)
         self.prompts = [f"a photo of a {w}" for w in vocab + REJECT_LABELS]
 
     @torch.no_grad()
-    def assess_name(self, crop, name):
+    def assess_name(self, crop, name, context_image=None):
         prompts = [template.format(name=name) for template in CLIP_VERIFY_PROMPTS]
-        inputs = self.processor(text=prompts, images=crop, return_tensors="pt", padding=True).to(self.device)
-        scores = self.model(**inputs).logits_per_image[0].detach().float().cpu().numpy()
+        images = [crop] if context_image is None else [crop, context_image]
+        inputs = self.processor(text=prompts, images=images,
+                                return_tensors="pt", padding=True).to(self.device)
+        scores = self.model(**inputs).logits_per_image.detach().float().cpu().numpy()
+        scores = scores[0] if context_image is None else (
+            (1 - CLIP_CONTEXT_WEIGHT) * scores[0] + CLIP_CONTEXT_WEIGHT * scores[1]
+        )
         probabilities = softmax(scores)
         candidate_confidence = float(probabilities[0])
         if candidate_confidence >= CLIP_VERIFY_ACCEPT:
@@ -293,20 +310,89 @@ class ClipNamer:
         alternatives = [(labels[i + 1], float(scores[i + 1])) for i in best]
         return rank, len(labels), alternatives
 
+    def _score_labels(self, images, labels):
+        prompts = [f"a photo of a {label}" for label in labels]
+        inputs = self.processor(text=prompts, images=images, return_tensors="pt",
+                                padding=True).to(self.device)
+        return self.model(**inputs).logits_per_image.detach().float().cpu().numpy()
+
+    def _find_alternative(self, crop, context_image, rejected_name):
+        labels = [label for label in self.fallback_vocab + REJECT_LABELS
+                  if not rejected_name or label.casefold() != rejected_name.casefold()]
+        if not self.fallback_vocab:
+            return ""
+        images = [crop] if context_image is None else [crop, context_image]
+        scores = self._score_labels(images, labels)
+        combined = scores[0] if context_image is None else (
+            (1 - CLIP_CONTEXT_WEIGHT) * scores[0] + CLIP_CONTEXT_WEIGHT * scores[1]
+        )
+        probabilities = softmax(combined)
+        index = int(probabilities.argmax())
+        if index < len(labels) and labels[index] in self.fallback_vocab \
+                and probabilities[index] >= self.min_conf:
+            return labels[index]
+        return ""
+
     @torch.no_grad()
-    def name_crops(self, crops, stop_event=None):
+    def name_crops(self, crops, stop_event=None, context_images=None):
+        if context_images is not None and len(context_images) != len(crops):
+            raise ValueError("There must be one context image for each crop.")
         names = []
+        self.last_verdicts = []
+        self.last_sources = []
         total = len(crops)
         for start in range(0, len(crops), 8):
             if stop_event is not None and stop_event.is_set():
                 raise Cancelled()
             batch = crops[start:start + 8]
-            inputs = self.processor(text=self.prompts, images=batch, return_tensors="pt", padding=True).to(self.device)
-            logits = self.model(**inputs).logits_per_image.detach().float().cpu().numpy()   # crops x prompts
-            for row in softmax(logits):
-                k = int(row.argmax())
-                names.append(self.vocab[k] if k < len(self.vocab) and row[k] >= self.min_conf else "")
-                print(f"  {len(names)}/{total}: {names[-1] or '(skipped)'}")
+            context_batch = None if context_images is None else context_images[start:start + len(batch)]
+            inputs = self.processor(text=self.prompts, images=batch,
+                                    return_tensors="pt", padding=True).to(self.device)
+            logits = self.model(**inputs).logits_per_image.detach().float().cpu().numpy()
+            for offset, (crop, crop_row) in enumerate(zip(batch, logits)):
+                if stop_event is not None and stop_event.is_set():
+                    raise Cancelled()
+                initial = softmax(crop_row)
+                candidate_index = int(initial.argmax())
+                initial_confident = (candidate_index < len(self.vocab)
+                                     and initial[candidate_index] >= self.min_conf)
+                candidate = self.vocab[candidate_index] if initial_confident else ""
+                training_mode = getattr(self, "training_mode", False)
+                if training_mode and not candidate and self.vocab:
+                    candidate_index = int(initial[:len(self.vocab)].argmax())
+                    candidate = self.vocab[candidate_index]
+                vocab_groups = getattr(self, "vocab_groups", [])
+                source_groups = (list(vocab_groups[candidate_index])
+                                 if candidate and candidate_index < len(vocab_groups) else [])
+                if candidate:
+                    verdict, confidence = self.assess_name(
+                        crop, candidate,
+                        None if context_batch is None else context_batch[offset],
+                    )
+                    if training_mode and not initial_confident:
+                        verdict = "unclear"
+                    print(f"  CLIP verification: {candidate!r} {verdict} ({confidence:.2f})")
+                else:
+                    verdict = "unclear" if training_mode else "no"
+                    print("  CLIP verification: no clear initial label")
+                self.last_verdicts.append(verdict)
+                self.last_sources.append(source_groups)
+                if training_mode:
+                    name = candidate
+                elif verdict == "yes":
+                    name = candidate
+                else:
+                    if candidate:
+                        print(f"  Searching all groups for an alternative to {candidate!r}...")
+                    name = self._find_alternative(
+                        crop,
+                        None if context_batch is None else context_batch[offset],
+                        candidate,
+                    )
+                    if name:
+                        print(f"  Alternative: {name!r}")
+                names.append(name)
+                print(f"  {len(names)}/{total}: {name or '(skipped)'}")
         return names
 
 
@@ -476,7 +562,7 @@ def build_parser():
                    help="custom vision-language model ID; overrides --vlm-size")
     p.add_argument("--clip-model", default=CLIP_MODEL, help="CLIP model used by --namer clip")
     p.add_argument("--clip-diagnostic", action="store_true",
-                   help="--namer vlm: print CLIP's best competing labels (diagnostic only; runs CLIP on CPU)")
+                   help="--namer vlm: print CLIP's best competing labels (adds a CLIP scoring pass)")
     p.add_argument("--min-confidence", type=float, default=CLIP_MIN_CONF, help="--namer clip: minimum confidence")
     p.add_argument("--groups", default="auto",
                    help="--namer clip vocabulary: 'auto' (scene recognition), 'all', or a comma-separated list "
@@ -505,6 +591,9 @@ def prepare(path, args, stop_event=None):
     image.thumbnail((MAX_SIDE, MAX_SIDE))
     shape = (image.height, image.width)
     device = pick_device()
+    training_mode = bool(getattr(args, "training_mode", False))
+    if training_mode and args.namer != "clip":
+        raise ValueError("Training mode requires --namer clip.")
 
     seg_path, seg_key = (None, None) if args.no_cache else segment_cache_path(args.cache_dir, path, args)
     instances = None
@@ -530,9 +619,17 @@ def prepare(path, args, stop_event=None):
             picked = detect_groups(image, device, args.auto_top, args.scene_model)
             groups = ",".join(["general"] + picked)
             print(f"Vocabulary groups: {groups}")
-        vocab = load_concepts(None, groups)
-        backend = ClipNamer(args.clip_model, vocab, device, args.min_confidence)
-        namer_id = sha({"namer": "clip", "model": args.clip_model, "vocab": vocab, "conf": args.min_confidence})
+        vocab, vocab_groups = load_concepts_with_groups(groups)
+        fallback_vocab = load_concepts(None, "all")
+        backend = ClipNamer(args.clip_model, vocab, device, args.min_confidence,
+                            fallback_vocab, training_mode, vocab_groups)
+        namer_id = sha({
+            "namer": "clip", "model": args.clip_model, "vocab": vocab,
+            "fallback_vocab": fallback_vocab, "conf": args.min_confidence,
+            "verification_version": CLIP_VERIFICATION_VERSION,
+            "context_weight": CLIP_CONTEXT_WEIGHT,
+            "training_mode": training_mode,
+        })
     else:
         vlm_model = args.vlm_model or VLM_MODELS[args.vlm_size]
         clip_vocab = load_concepts(None, "all") if args.clip_diagnostic else []
@@ -543,15 +640,18 @@ def prepare(path, args, stop_event=None):
                         "crop_padding": CROP_PADDING, "context_fit": "pad",
                         "clip_verify_prompts": CLIP_VERIFY_PROMPTS,
                         "clip_verify_thresholds": [CLIP_VERIFY_REJECT, CLIP_VERIFY_ACCEPT],
+                        "clip_context_weight": CLIP_CONTEXT_WEIGHT,
                         "clip_diagnostic": args.clip_diagnostic,
                         "clip_model": args.clip_model})
     check_cancel()
 
     names_file = names_path(seg_path, namer_id) if seg_path else None
-    if names_file and not args.recompute:
+    if names_file and not args.recompute and not training_mode:
         load_names(names_file, instances)
 
     image_arr = np.array(image)
+    training_statuses = {}
+    training_sources = {}
 
     def namer(batch, stop=None):
         todo = [i for i in batch if i.name is None]
@@ -559,19 +659,28 @@ def prepare(path, args, stop_event=None):
             return
         print(f"Naming {len(todo)} segments...")
         crops = [crop_segment(image_arr, i.mask) for i in todo]
+        context_images = [highlight_segment(image_arr, i.mask) for i in todo]
         if args.namer == "vlm":
-            context_images = [highlight_segment(image_arr, i.mask) for i in todo]
             names = backend.name_crops(crops, context_images, stop)
         else:
-            names = backend.name_crops(crops, stop)
-        for inst, name in zip(todo, names):
+            names = backend.name_crops(crops, stop, context_images)
+        for index, (inst, name) in enumerate(zip(todo, names)):
             inst.name = name
-        if names_file:
+            if args.namer == "clip":
+                training_statuses[id(inst)] = backend.last_verdicts[index]
+                training_sources[id(inst)] = backend.last_sources[index]
+        if names_file and not training_mode:
             save_names(names_file, instances)
 
     print("Choosing and naming the objects for the first game...")
     first_game = base.pick_chosen(instances, namer, stop_event)
-    return image, instances, {"namer": namer, "first_game": first_game}
+    extras = {"namer": namer, "first_game": first_game}
+    if training_mode:
+        extras["training_items"] = [
+            (inst, training_statuses[id(inst)], training_sources[id(inst)]) for inst in first_game
+            if training_statuses.get(id(inst)) in ("no", "unclear")
+        ]
+    return image, instances, extras
 
 
 def main():

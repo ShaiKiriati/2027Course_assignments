@@ -19,7 +19,7 @@ There are two kinds of game:
 
 Put these files in one folder:
 
-`hidden_objects_web.py`, `hidden_objects_app.py`, `segment_and_name_sam3.py`, `segment_then_name.py`, `requirements.txt`, `environment.yml`, `check_setup.py`, and (Windows) `play_hidden_objects_web.bat` and `play_hidden_objects_phone.bat`.
+`hidden_objects_web.py`, `hidden_objects_training.html`, `hidden_objects_app.py`, `segment_and_name_sam3.py`, `segment_then_name.py`, `clip_word_groups.json`, `requirements.txt`, `environment.yml`, `check_setup.py`, and (Windows) the launcher files.
 
 ## 2. Install the dependencies
 
@@ -29,10 +29,10 @@ Open an Anaconda or Miniconda prompt in the folder and run:
 
 ```
 conda env create -f environment.yml
-conda activate sam3-objects
+conda activate web-obj-game
 ```
 
-The environment must be called `sam3-objects` if you want to use `play_hidden_objects_web.bat`.
+The environment must be called `web-obj-game` to use the Windows launchers.
 
 ### Without conda
 
@@ -74,6 +74,8 @@ It lists what is installed, whether a GPU is found, whether you are logged in, a
 
 **Windows:** double-click `play_hidden_objects_web.bat`. The game opens in your browser without leaving a terminal window open. If the launcher cannot find the conda environment, it tells you what to edit.
 
+To use the developer-oriented CLIP label trainer instead, double-click `train_clip_labels_web.bat`. It opens at http://127.0.0.1:5001, separately from the normal game. The trainer shows only rejected or uncertain labels from the sampled segments. Corrections are saved directly into the source group in `clip_word_groups.json`, alongside the original words, so they are available to future training and normal CLIP runs. If a proposed label occurs in multiple selected groups, choose which group's list to update.
+
 **Any system:**
 ```
 python hidden_objects_web.py
@@ -108,6 +110,7 @@ Results are saved per photo, so a photo you have played before starts almost imm
 - Use a smaller segmentation model: "SAM 2.1 small" or "tiny".
 - On the word-list game, let the scene recognition pick the word groups instead of searching every group.
 - Use "CLIP with the word groups" instead of the vision-language model for naming.
+- In CLIP naming mode, each proposed label is checked against the segment and highlighted scene; if it disagrees, CLIP searches all word groups for an alternative.
 - In the open-ended game, CLIP checks VLM-proposed names first; only uncertain CLIP results need the slower VLM verification call. The optional `--clip-diagnostic` also prints competing labels.
 
 To run the open-ended script with the diagnostic enabled:
@@ -134,11 +137,13 @@ python segment_then_name.py photo.jpg --clip-diagnostic
 | File | Purpose |
 |---|---|
 | `hidden_objects_web.py` | The game as a local web app (Flask) |
+| `hidden_objects_training.html` | Dedicated interactive CLIP label-training page |
 | `hidden_objects_app.py` | The game as a desktop window (tkinter) |
 | `segment_and_name_sam3.py` | The word-list game and the game window logic |
 | `segment_then_name.py` | The open-ended game |
+| `clip_word_groups.json` | Built-in and training-added words, organized by CLIP group |
 | `requirements.txt`, `environment.yml` | Dependencies |
 | `check_setup.py` | Checks your installation |
-| `play_hidden_objects_web.bat`, `play_hidden_objects_phone.bat`, `play_hidden_objects.bat` | Windows launchers (web without a terminal, web for phones on your Wi-Fi without a terminal, and desktop versions) |
+| `play_hidden_objects_web.bat`, `play_hidden_objects_phone.bat`, `train_clip_labels_web.bat`, `play_hidden_objects.bat` | Windows launchers (normal web, web for phones on your Wi-Fi, CLIP label trainer, and desktop versions) |
 
 The models are the property of their authors and are downloaded from Hugging Face under their own licenses. Read the license on each model page before sharing or using the game beyond personal use.

@@ -87,7 +87,8 @@ QUALITY_PROMPT_TEMPLATES = (
 )
 
 BAD_NAMES = {"unclear", "unknown", "none", "nothing", "background", "image", "picture", "photo",
-             "texture", "pattern", "n/a", "na", "object", "item", "thing", "something"}
+             "texture", "pattern", "n/a", "na", "object", "item", "thing", "something",
+             "it", "target", "target object", "target segment", "highlighted object", "highlighted segment"}
 LEADING = re.compile(r"^(the|a|an|this is|it is|it's|there is|there's|image of|picture of|photo of|close up of)\s+")
 
 
@@ -162,6 +163,7 @@ def clean_name(text):
     lines = text.strip().splitlines()
     t = lines[0] if lines else ""
     t = t.lower().strip(" .,:;!?\"'`*_-")
+    t = re.sub(r"^(?:object|label|name)\s*:\s*", "", t)
     for _ in range(3):   # strip stacked lead-ins such as "this is a ..."
         t = LEADING.sub("", t)
     t = t.strip(" .,:;!?\"'`*_-")
@@ -539,6 +541,7 @@ def prepare(path, args, stop_event=None):
         namer_id = sha({"namer": "vlm", "model": vlm_model, "prompt": VLM_PROMPT,
                         "verify_prompt": VLM_VERIFY_PROMPT, "image_size": VLM_CROP_SIZE,
                         "crop_padding": CROP_PADDING, "context_fit": "pad",
+                        "name_cleanup": 2,
                         "clip_verify_prompts": CLIP_VERIFY_PROMPTS,
                         "clip_verify_thresholds": [CLIP_VERIFY_REJECT, CLIP_VERIFY_ACCEPT],
                         "clip_diagnostic": args.clip_diagnostic,

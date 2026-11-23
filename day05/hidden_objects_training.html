@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLIP Label Training</title>
+<style>
+  :root { --bg:#f4f6f9; --card:#fff; --text:#1c2230; --muted:#5f6b7c; --accent:#2f6fed; --border:#d5dae3; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151b; --card:#1b2029; --text:#e8ebf2; --muted:#9aa3b2; --accent:#6b9bff; --border:#323a49; }
+  }
+  [hidden] { display:none !important; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.45 system-ui,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); }
+  header { padding:14px 20px; background:var(--card); border-bottom:1px solid var(--border); }
+  h1 { font-size:1.2rem; margin:0; }
+  main { max-width:1100px; margin:0 auto; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:14px 16px; margin-bottom:12px; }
+  h2 { font-size:1rem; margin:0 0 8px; }
+  .note { color:var(--muted); font-size:.92rem; }
+  .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin:8px 0; }
+  input[type=number] { width:6em; padding:5px; font:inherit; }
+  button { font:inherit; padding:8px 14px; border:1px solid var(--border); border-radius:8px; color:var(--text); background:var(--card); cursor:pointer; }
+  button:disabled { opacity:.55; cursor:default; }
+  button.primary { color:#fff; background:var(--accent); border-color:var(--accent); font-weight:600; }
+  label { margin-right:12px; }
+  #groupBoxes { display:flex; gap:4px 14px; flex-wrap:wrap; margin:8px 0 8px 24px; }
+  #error { color:#c62828; white-space:pre-wrap; }
+  #log { max-height:220px; overflow:auto; white-space:pre-wrap; font:13px/1.4 ui-monospace,Consolas,monospace; }
+  #stage { position:relative; display:inline-block; max-width:100%; line-height:0; }
+  #photo { display:block; max-width:100%; max-height:70vh; border-radius:6px; }
+  #outline { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
+  #labels { list-style:none; padding:0; margin:14px 0 0; display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:8px; }
+  #labels li { min-width:0; }
+  .label-button { width:100%; display:flex; align-items:center; gap:9px; text-align:left; border-left:6px solid var(--label-color); }
+  .swatch { width:13px; height:13px; flex:none; border-radius:50%; background:var(--label-color); }
+  .label-text { flex:1; overflow-wrap:anywhere; }
+  .status { color:var(--muted); font-size:.78rem; text-transform:uppercase; }
+  .saved { color:#20823a; font-size:.8rem; }
+  #toast { position:fixed; left:50%; top:14px; transform:translateX(-50%); max-width:90vw; padding:10px 16px; border-radius:8px; color:#fff; background:#253044; z-index:5; }
+  #editDialog { width:min(440px,90vw); border:1px solid var(--border); border-radius:10px; padding:18px; color:var(--text); background:var(--card); }
+  #editDialog::backdrop { background:rgba(0,0,0,.45); }
+  #editForm { display:grid; gap:12px; }
+  #editForm label { display:grid; gap:4px; margin:0; }
+  #editForm input, #editForm select { width:100%; padding:7px; font:inherit; }
+  @media (max-width:600px) { main { padding:10px; } header { padding:12px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>CLIP Label Training</h1>
+  <div class="note">Review CLIP's rejected or uncertain labels. Click a label to correct it and save it into its source group.</div>
+</header>
+<div id="toast" hidden></div>
+<dialog id="editDialog">
+  <form id="editForm" method="dialog">
+    <h2>Correct label</h2>
+    <label>Corrected name <input id="editWord" type="text" maxlength="80" required></label>
+    <label>Group to update <select id="editGroup"></select></label>
+    <p class="note">The corrected name will be saved in this group's word list.</p>
+    <div class="row">
+      <button value="cancel">Cancel</button>
+      <button id="saveEdit" type="button" class="primary">Save correction</button>
+    </div>
+  </form>
+</dialog>
+<main>
+  <section id="setup" class="card">
+    <h2>Choose a photo and settings</h2>
+    <div class="row"><input type="file" id="photoFile" accept="image/png,image/jpeg"></div>
+    <div class="row">
+      <label>Segmentation model <select id="sam"></select></label>
+      <label>Detail points per side <input id="detail" type="number" min="8" max="64" value="24"></label>
+      <label><input id="useCache" type="checkbox" checked> Reuse cached segments</label>
+    </div>
+    <div>
+      <label><input type="radio" name="groupMode" value="auto" checked> Auto groups</label>
+      <label><input type="radio" name="groupMode" value="all"> All groups</label>
+      <label><input type="radio" name="groupMode" value="custom"> Choose groups</label>
+      <label id="autoTopLabel">Groups to add <input id="autoTop" type="number" min="1" max="6" value="3"></label>
+      <div id="groupBoxes"></div>
+    </div>
+    <p class="note">Training reviews the rejected or uncertain labels among the same 5–20 sampled segments used by the game. Accepted labels are not shown.</p>
+    <div class="row">
+      <button id="start" class="primary" disabled>Find labels to review</button>
+      <span id="deviceNote" class="note">Loading model information…</span>
+    </div>
+    <p id="error" hidden></p>
+  </section>
+
+  <section id="working" class="card" hidden>
+    <h2>Analyzing the photo</h2>
+    <p id="workText" class="note">Preparing…</p>
+    <pre id="log"></pre>
+    <button id="cancel">Cancel</button>
+  </section>
+
+  <section id="review" hidden>
+    <div class="card">
+      <div class="row">
+        <h2 id="reviewTitle" style="flex:1">Labels to review</h2>
+        <button id="another">Train another photo</button>
+      </div>
+      <p class="note">Each outline uses the same color as its label. Click a label, enter the correction, and save it to the source group's word list.</p>
+      <p id="empty" hidden>No rejected or uncertain labels in this sample. Try another photo or group selection.</p>
+      <div id="stage"><img id="photo" alt="Photo with segments to review"><img id="outline" alt=""></div>
+      <ol id="labels"></ol>
+    </div>
+  </section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let info = null, game = null, activeJob = null, pendingItem = null, previousErrorId = 0, toastTimer = null;
+async function api(url, opts) {
+  const response = await fetch(url, opts);
+  let data = {};
+  try { data = await response.json(); } catch (_) {}
+  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  return data;
+}
+function showToast(message) {
+  const toast = $("toast"); toast.textContent = message; toast.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { toast.hidden = true; }, 5000);
+}
+function selectedGroupMode() {
+  return document.querySelector('input[name="groupMode"]:checked').value;
+}
+function updateGroupControls() {
+  const mode = selectedGroupMode();
+  $("autoTopLabel").hidden = mode !== "auto";
+  document.querySelectorAll("#groupBoxes input").forEach(box => { box.disabled = mode !== "custom"; });
+}
+async function loadInfo() {
+  try { info = await api("/api/info"); }
+  catch (error) { $("deviceNote").textContent = error.message; setTimeout(loadInfo, 1500); return; }
+  if (!info.ready) {
+    $("deviceNote").textContent = info.load_error || "Loading application libraries…";
+    if (!info.load_error) setTimeout(loadInfo, 1000);
+    return;
+  }
+  for (const choice of info.sam_choices) {
+    const option = document.createElement("option"); option.value = choice; option.textContent = choice;
+    $("sam").appendChild(option);
+  }
+  for (const group of info.groups) {
+    const label = document.createElement("label");
+    const checkbox = document.createElement("input"); checkbox.type = "checkbox"; checkbox.value = group; checkbox.disabled = true;
+    label.append(checkbox, document.createTextNode(" " + group)); $("groupBoxes").appendChild(label);
+  }
+  $("deviceNote").textContent = info.device_label;
+  $("start").disabled = false;
+}
+async function startTraining() {
+  $("error").hidden = true;
+  const photo = $("photoFile").files[0];
+  if (!photo) { $("error").textContent = "Choose a PNG or JPEG photo."; $("error").hidden = false; return; }
+  const detail = Number($("detail").value), autoTop = Number($("autoTop").value);
+  if (!Number.isInteger(detail) || detail < 8 || detail > 64) {
+    $("error").textContent = "Detail must be between 8 and 64."; $("error").hidden = false; return;
+  }
+  const mode = selectedGroupMode();
+  const groups = [...document.querySelectorAll("#groupBoxes input:checked")].map(input => input.value);
+  if (mode === "custom" && !groups.length) {
+    $("error").textContent = "Choose at least one group."; $("error").hidden = false; return;
+  }
+  if (mode === "auto" && (!Number.isInteger(autoTop) || autoTop < 1 || autoTop > 6)) {
+    $("error").textContent = "Groups to add must be between 1 and 6."; $("error").hidden = false; return;
+  }
+  const settings = {
+    mode: "free", naming: "clip", sam: $("sam").value, detail,
+    group_mode: mode, groups, auto_top: autoTop, use_cache: $("useCache").checked
+  };
+  const form = new FormData(); form.append("photo", photo); form.append("settings", JSON.stringify(settings));
+  $("start").disabled = true; $("setup").hidden = true; $("working").hidden = false;
+  try {
+    previousErrorId = (await api("/api/status")).error_id;
+    await api("/api/start", { method: "POST", body: form });
+    activeJob = await api("/api/status");
+    poll();
+  } catch (error) {
+    $("working").hidden = true; $("setup").hidden = false; $("start").disabled = false;
+    $("error").textContent = error.message; $("error").hidden = false;
+  }
+}
+async function poll() {
+  try {
+    const status = await api("/api/status");
+    $("log").textContent = status.log || "";
+    $("workText").textContent = status.phase === "working" ? "Analyzing segments and labels…" : "Loading review…";
+    if (status.phase === "working" || status.job_id !== activeJob.job_id) {
+      setTimeout(poll, 800); return;
+    }
+    if (status.error_id > previousErrorId) {
+      throw new Error(status.error || "Training analysis failed.");
+    }
+    await loadReview();
+  } catch (error) {
+    $("working").hidden = true; $("setup").hidden = false; $("start").disabled = false;
+    $("error").textContent = error.message; $("error").hidden = false;
+  }
+}
+async function loadReview() {
+  game = await api("/api/training");
+  $("photo").src = "/api/image?g=" + game.game_id;
+  $("outline").src = "/api/training/outline/" + game.game_id + ".png";
+  $("reviewTitle").textContent = `${game.items.length} label${game.items.length === 1 ? "" : "s"} to review`;
+  $("empty").hidden = game.items.length !== 0;
+  const list = $("labels"); list.replaceChildren();
+  for (const item of game.items) {
+    const li = document.createElement("li");
+    const button = document.createElement("button"); button.type = "button";
+    button.className = "label-button"; button.style.setProperty("--label-color", item.color);
+    const swatch = document.createElement("span"); swatch.className = "swatch";
+    const text = document.createElement("span"); text.className = "label-text"; text.textContent = item.label;
+    const status = document.createElement("span"); status.className = "status";
+    status.textContent = `${item.status} · ${item.source_groups.join(", ")}`;
+    button.append(swatch, text, status);
+    if (item.saved) {
+      const saved = document.createElement("span"); saved.className = "saved"; saved.textContent = "saved";
+      button.appendChild(saved);
+    }
+    button.addEventListener("click", () => editLabel(item));
+    li.appendChild(button); list.appendChild(li);
+  }
+  $("working").hidden = true; $("review").hidden = false;
+}
+function editLabel(item) {
+  pendingItem = item;
+  $("editWord").value = item.label;
+  const group = $("editGroup"); group.replaceChildren();
+  for (const name of item.source_groups) {
+    const option = document.createElement("option"); option.value = name; option.textContent = name;
+    group.appendChild(option);
+  }
+  $("editDialog").showModal();
+  $("editWord").focus();
+}
+async function saveLabel() {
+  const item = pendingItem;
+  if (!item) return;
+  const word = $("editWord").value, group = $("editGroup").value;
+  $("saveEdit").disabled = true;
+  try {
+    const result = await api("/api/training/learn", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ game_id: game.game_id, index: item.index, word, group })
+    });
+    item.label = result.word; item.saved = true;
+    $("editDialog").close();
+    await loadReview();
+    showToast(result.added ? `"${result.word}" added to the ${result.group} group.` :
+      `"${result.word}" was already in the ${result.group} group.`);
+  } catch (error) { showToast(error.message); }
+  finally { $("saveEdit").disabled = false; }
+}
+async function cancelTraining() {
+  try { await api("/api/cancel", { method: "POST" }); } catch (error) { showToast(error.message); }
+}
+$("start").addEventListener("click", startTraining);
+$("cancel").addEventListener("click", cancelTraining);
+$("saveEdit").addEventListener("click", saveLabel);
+$("editDialog").addEventListener("close", () => { pendingItem = null; });
+$("another").addEventListener("click", () => {
+  $("review").hidden = true; $("setup").hidden = false; $("photoFile").value = "";
+});
+document.querySelectorAll('input[name="groupMode"]').forEach(input => input.addEventListener("change", updateGroupControls));
+updateGroupControls();
+loadInfo();
+</script>
+</body>
+</html>
