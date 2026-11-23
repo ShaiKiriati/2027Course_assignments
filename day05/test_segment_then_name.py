@@ -360,6 +360,7 @@ def test_vlm_name_one_cleans_answer(monkeypatch):
 def test_vlm_name_crops_verifies_and_rejects(monkeypatch):
     namer = object.__new__(sut.VlmNamer)
     namer.clip_diagnostic = None
+    namer.clip_verifier = None
     monkeypatch.setattr(namer, "name_one", lambda *a: "mug")
     monkeypatch.setattr(namer, "verify_name", lambda *a: (False, "no"))
     crops = [Image.new("RGB", (2, 2))]
@@ -370,6 +371,7 @@ def test_vlm_name_crops_verifies_and_rejects(monkeypatch):
 def test_vlm_name_crops_keeps_verified_name(monkeypatch):
     namer = object.__new__(sut.VlmNamer)
     namer.clip_diagnostic = None
+    namer.clip_verifier = None
     monkeypatch.setattr(namer, "name_one", lambda *a: "mug")
     monkeypatch.setattr(namer, "verify_name", lambda *a: (True, "yes"))
     crops = [Image.new("RGB", (2, 2))]
@@ -380,6 +382,7 @@ def test_vlm_name_crops_keeps_verified_name(monkeypatch):
 def test_vlm_name_crops_honors_cancellation():
     namer = object.__new__(sut.VlmNamer)
     namer.clip_diagnostic = None
+    namer.clip_verifier = None
 
     class Stop:
         def is_set(self):
@@ -388,6 +391,63 @@ def test_vlm_name_crops_honors_cancellation():
     with pytest.raises(sut.Cancelled):
         namer.name_crops([Image.new("RGB", (2, 2))],
                          [Image.new("RGB", (2, 2))], Stop())
+
+
+@pytest.mark.parametrize(("confidence", "expected"), [
+    (0.90, "yes"),
+    (0.10, "no"),
+    (0.50, "unclear"),
+])
+def test_clip_assesses_proposed_name(confidence, expected):
+    namer = object.__new__(sut.ClipNamer)
+    namer.device = "cpu"
+
+    class Inputs(dict):
+        def to(self, device):
+            return self
+
+    class FakeProcessor:
+        def __call__(self, **kwargs):
+            self.kwargs = kwargs
+            return Inputs()
+
+    class FakeModel:
+        def __call__(self, **kwargs):
+            # Use equal non-candidate logits; choose candidate odds for each band.
+            candidate = np.log(confidence / (1 - confidence)) + np.log(4)
+            return SimpleNamespace(logits_per_image=sut.torch.tensor(
+                [[candidate, 0.0, 0.0, 0.0, 0.0]]))
+
+    namer.processor = FakeProcessor()
+    namer.model = FakeModel()
+    verdict, score = namer.assess_name(Image.new("RGB", (2, 2)), "red cup")
+
+    assert verdict == expected
+    assert score == pytest.approx(confidence)
+    assert namer.processor.kwargs["text"] == [
+        template.format(name="red cup") for template in sut.CLIP_VERIFY_PROMPTS
+    ]
+
+
+@pytest.mark.parametrize(("verdict", "expected", "should_verify"), [
+    ("yes", "mug", False),
+    ("no", "", False),
+    ("unclear", "mug", True),
+])
+def test_vlm_name_crops_uses_vlm_only_for_uncertain_clip(
+        monkeypatch, verdict, expected, should_verify):
+    namer = object.__new__(sut.VlmNamer)
+    namer.clip_diagnostic = False
+    namer.clip_verifier = SimpleNamespace(assess_name=lambda *args: (verdict, 0.5))
+    verified = []
+    monkeypatch.setattr(namer, "name_one", lambda *args: "mug")
+    monkeypatch.setattr(namer, "verify_name",
+                        lambda *args: (verified.append(True) or True, "yes"))
+    result = namer.name_crops([Image.new("RGB", (2, 2))],
+                              [Image.new("RGB", (2, 2))])
+
+    assert result == [expected]
+    assert bool(verified) is should_verify
 
 
 def test_clip_namer_batches_and_applies_confidence(monkeypatch):
@@ -759,7 +819,7 @@ def test_prepare_uses_selected_namer_and_returns_opening_game(tmp_path, monkeypa
     class FakeClipNamer:
         def __init__(self, clip_model, vocab, device, min_confidence):
             assert (clip_model, vocab, device, min_confidence) == (
-                "fake-clip", ["cup"], "cpu", 0.2,
+                "fake-clip", ["cup"] if namer_kind == "clip" else [], "cpu", 0.2,
             )
 
         def name_crops(self, crops, stop=None):
@@ -767,10 +827,11 @@ def test_prepare_uses_selected_namer_and_returns_opening_game(tmp_path, monkeypa
             return ["cup"]
 
     class FakeVlmNamer:
-        def __init__(self, model_id, device, clip_diagnostic):
+        def __init__(self, model_id, device, clip_verifier, clip_diagnostic):
             assert model_id == sut.VLM_MODELS["500M"]
             assert device == "cpu"
-            assert clip_diagnostic is None
+            assert isinstance(clip_verifier, FakeClipNamer)
+            assert clip_diagnostic is False
 
         def name_crops(self, crops, context_images, stop=None):
             assert len(crops) == len(context_images) == 1

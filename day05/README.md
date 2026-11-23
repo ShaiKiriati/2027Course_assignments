@@ -108,7 +108,7 @@ Results are saved per photo, so a photo you have played before starts almost imm
 - Use a smaller segmentation model: "SAM 2.1 small" or "tiny".
 - On the word-list game, let the scene recognition pick the word groups instead of searching every group.
 - Use "CLIP with the word groups" instead of the vision-language model for naming.
-- The VLM's CLIP diagnostic loads CLIP on the CPU and can be slow; it is intended to help inspect competing labels, not to decide correctness.
+- In the open-ended game, CLIP checks VLM-proposed names first; only uncertain CLIP results need the slower VLM verification call. The optional `--clip-diagnostic` also prints competing labels.
 
 To run the open-ended script with the diagnostic enabled:
 

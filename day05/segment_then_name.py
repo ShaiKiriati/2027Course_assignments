@@ -6,7 +6,8 @@ Hidden Object Game, open-ended version: segment first, name afterwards.
    word list involved.
 2. Each game picks 5-20 of those segments at random and names only those:
    - "vlm" (default): a vision-language model sees the full photo with the
-     segment highlighted, plus a close-up, names it, then verifies the proposed name.
+     segment highlighted, plus a close-up, names it. CLIP quickly checks the
+     proposed name; the VLM verifies only uncertain cases.
    - "clip": CLIP picks the best match from the word groups (much faster).
 3. The names become the list in the game window. Click objects to find them.
    Press N for a new game: new random segments are picked and named.
@@ -53,6 +54,15 @@ MAX_SEGMENTS = 80       # keep the best-scoring segments only
 MIN_AREA, MAX_AREA = 0.004, 0.60   # allowed segment size (fraction of the image)
 NMS_IOU = 0.6           # drop near-duplicate segments
 CLIP_MIN_CONF = 0.15    # --namer clip: reject names CLIP is unsure about
+CLIP_VERIFY_ACCEPT = 0.70
+CLIP_VERIFY_REJECT = 0.25
+CLIP_VERIFY_PROMPTS = (
+    "a photo showing {name}",
+    "a photo showing a different object, not {name}",
+    "a photo showing only a small fragment of an object",
+    "a photo of background, a texture, or a shadow",
+    "a blurry or ambiguous photo where the object cannot be identified",
+)
 CROP_PADDING = 0.05     # fraction of the segment bounding box to include around the mask
 VLM_CROP_SIZE = 512     # images shown to the VLM at this size
 CACHE_VERSION = 1
@@ -183,9 +193,10 @@ def load_vlm(model_id, device):
 class VlmNamer:
     """Open-ended naming with both full-scene context and a masked segment close-up."""
 
-    def __init__(self, model_id, device, clip_diagnostic=None):
+    def __init__(self, model_id, device, clip_verifier=None, clip_diagnostic=False):
         print(f"Loading the naming model {model_id}...")
         self.device = device
+        self.clip_verifier = clip_verifier
         self.clip_diagnostic = clip_diagnostic
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.model = load_vlm(model_id, device)
@@ -222,13 +233,20 @@ class VlmNamer:
                 raise Cancelled()
             name = self.name_one(context_image, crop)
             if name:
-                if self.clip_diagnostic is not None:
-                    rank, total, alternatives = self.clip_diagnostic.diagnose_name(crop, name)
+                if self.clip_diagnostic:
+                    rank, total, alternatives = self.clip_verifier.diagnose_name(crop, name)
                     top = ", ".join(f"{label} ({score:.1f})" for label, score in alternatives)
                     print(f"  CLIP diagnostic: {name!r} ranked {rank}/{total}; alternatives: {top}")
-                supported, answer = self.verify_name(context_image, crop, name)
-                if not supported:
-                    print(f"  {k}/{len(crops)}: {name!r} rejected by verifier ({answer!r})")
+                verdict = "unclear"
+                if self.clip_verifier is not None:
+                    verdict, confidence = self.clip_verifier.assess_name(crop, name)
+                    print(f"  CLIP check: {name!r} {verdict} ({confidence:.2f})")
+                if verdict == "unclear":
+                    supported, answer = self.verify_name(context_image, crop, name)
+                    verdict = "yes" if supported else "no"
+                    if verdict != "yes":
+                        print(f"  {k}/{len(crops)}: {name!r} rejected by VLM verifier ({answer!r})")
+                if verdict == "no":
                     name = ""
             names.append(name)
             print(f"  {k}/{len(crops)}: {name or '(not a clear object, skipped)'}")
@@ -239,11 +257,29 @@ class ClipNamer:
     """Fast naming: CLIP picks the best match from a vocabulary (the word groups)."""
 
     def __init__(self, clip_name, vocab, device, min_conf):
-        print(f"Loading CLIP ({clip_name}) with {len(vocab)} names on {device}...")
+        if vocab:
+            print(f"Loading CLIP ({clip_name}) with {len(vocab)} names on {device}...")
+        else:
+            print(f"Loading CLIP verifier ({clip_name}) on {device}...")
         self.device, self.vocab, self.min_conf = device, vocab, min_conf
         self.model = CLIPModel.from_pretrained(clip_name).to(device).eval()
         self.processor = CLIPProcessor.from_pretrained(clip_name)
         self.prompts = [f"a photo of a {w}" for w in vocab + REJECT_LABELS]
+
+    @torch.no_grad()
+    def assess_name(self, crop, name):
+        prompts = [template.format(name=name) for template in CLIP_VERIFY_PROMPTS]
+        inputs = self.processor(text=prompts, images=crop, return_tensors="pt", padding=True).to(self.device)
+        scores = self.model(**inputs).logits_per_image[0].detach().float().cpu().numpy()
+        probabilities = softmax(scores)
+        candidate_confidence = float(probabilities[0])
+        if candidate_confidence >= CLIP_VERIFY_ACCEPT:
+            verdict = "yes"
+        elif candidate_confidence <= CLIP_VERIFY_REJECT:
+            verdict = "no"
+        else:
+            verdict = "unclear"
+        return verdict, candidate_confidence
 
     @torch.no_grad()
     def diagnose_name(self, crop, name):
@@ -499,15 +535,16 @@ def prepare(path, args, stop_event=None):
         namer_id = sha({"namer": "clip", "model": args.clip_model, "vocab": vocab, "conf": args.min_confidence})
     else:
         vlm_model = args.vlm_model or VLM_MODELS[args.vlm_size]
-        clip_diagnostic = None
-        if args.clip_diagnostic:
-            clip_diagnostic = ClipNamer(args.clip_model, load_concepts(None, "all"), "cpu", args.min_confidence)
-        backend = VlmNamer(vlm_model, device, clip_diagnostic)
+        clip_vocab = load_concepts(None, "all") if args.clip_diagnostic else []
+        clip_verifier = ClipNamer(args.clip_model, clip_vocab, device, args.min_confidence)
+        backend = VlmNamer(vlm_model, device, clip_verifier, args.clip_diagnostic)
         namer_id = sha({"namer": "vlm", "model": vlm_model, "prompt": VLM_PROMPT,
                         "verify_prompt": VLM_VERIFY_PROMPT, "image_size": VLM_CROP_SIZE,
                         "crop_padding": CROP_PADDING, "context_fit": "pad",
+                        "clip_verify_prompts": CLIP_VERIFY_PROMPTS,
+                        "clip_verify_thresholds": [CLIP_VERIFY_REJECT, CLIP_VERIFY_ACCEPT],
                         "clip_diagnostic": args.clip_diagnostic,
-                        "clip_model": args.clip_model if args.clip_diagnostic else None})
+                        "clip_model": args.clip_model})
     check_cancel()
 
     names_file = names_path(seg_path, namer_id) if seg_path else None
